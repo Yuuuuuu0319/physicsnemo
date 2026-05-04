@@ -26,11 +26,14 @@ hydra:
 # Data configuration: paths for training and testing datasets.
 data_dir: ./data
 test_dir: ./data/Test
+hydrograph_ids_file: train.txt
 
 # Training configuration.
+seed: 0
 batch_size: 1
 epochs: 100
 num_training_samples: 400
+max_train_batches: null
 num_training_time_steps: 300
 lr: 0.0001
 lr_decay_rate: 0.9999979
@@ -47,6 +50,19 @@ n_time_steps: 2           # Number of time steps in the sliding window.
 use_physics_loss: true
 delta_t: 1200.0
 physics_loss_weight: 1.0
+
+# Fidelity-zone configuration. This is intentionally separate from any future
+# edge-informed local-conservation work.
+use_fidelity_zones: false
+zone_label_file: zone_label.txt
+zone_weight_file: zone_weight.txt
+zone_loss_weight: 0.0
+log_zone_metrics: false
+
+# Edge-local proxy branch. Disabled by default so node-zone experiments and
+# baseline HydroGraphNet runs stay separate.
+use_edge_local_proxy: false
+edge_local_loss_weight: 0.0
 
 # Performance and optimization configurations.
 use_apex: True            # Use NVIDIA Apex for mixed precision if available.

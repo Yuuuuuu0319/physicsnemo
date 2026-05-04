@@ -15,8 +15,10 @@
 # limitations under the License.
 
 import time
+import random
 
 import hydra
+import numpy as np
 import torch
 import torch.nn as nn
 import torch_geometric as pyg
@@ -37,7 +39,12 @@ from physicsnemo.utils.logging import PythonLogger, RankZeroLoggingWrapper
 from physicsnemo.utils.logging.wandb import initialize_wandb
 from physicsnemo.utils import load_checkpoint, save_checkpoint
 from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
-from utils import compute_physics_loss
+from utils import (
+    compute_edge_local_proxy_loss,
+    compute_physics_loss,
+    compute_zone_metrics,
+    compute_zone_weighted_loss,
+)
 
 
 # Custom collate function that checks if each item is a tuple (graph, physics_data) or a plain graph.
@@ -68,6 +75,11 @@ class MGNTrainer:
         self.use_physics_loss = cfg.get("use_physics_loss", False)
         self.delta_t = cfg.get("delta_t", 1200.0)
         self.physics_loss_weight = cfg.get("physics_loss_weight", 1.0)
+        self.use_fidelity_zones = cfg.get("use_fidelity_zones", False)
+        self.zone_loss_weight = cfg.get("zone_loss_weight", 0.0)
+        self.log_zone_metrics = cfg.get("log_zone_metrics", False)
+        self.use_edge_local_proxy = cfg.get("use_edge_local_proxy", False)
+        self.edge_local_loss_weight = cfg.get("edge_local_loss_weight", 0.0)
 
         # Set activation function.
         mlp_act = "relu"
@@ -83,14 +95,18 @@ class MGNTrainer:
             name="hydrograph_dataset",
             data_dir=cfg.data_dir,
             prefix="M80",
-            num_samples=500,
+            num_samples=cfg.num_training_samples,
             n_time_steps=cfg.n_time_steps,
             k=4,
             noise_type=cfg.noise_type,
             noise_std=0.01,
-            hydrograph_ids_file="train.txt",
+            hydrograph_ids_file=cfg.get("hydrograph_ids_file", "train.txt"),
             split="train",
             return_physics=self.use_physics_loss,
+            use_fidelity_zones=self.use_fidelity_zones,
+            zone_label_file=cfg.get("zone_label_file", "zone_label.txt"),
+            zone_weight_file=cfg.get("zone_weight_file", "zone_weight.txt"),
+            return_edge_local=self.use_edge_local_proxy,
         )
         sampler = DistributedSampler(
             dataset,
@@ -251,6 +267,19 @@ class MGNTrainer:
                     )
                     loss = loss + self.physics_loss_weight * phy_loss
                     loss_dict["physics_loss"] = phy_loss
+                if self.use_fidelity_zones and self.zone_loss_weight > 0:
+                    zone_loss = compute_zone_weighted_loss(pred_one, graph.y, graph)
+                    loss = loss + self.zone_loss_weight * zone_loss
+                    loss_dict["zone_loss"] = zone_loss
+                if self.use_edge_local_proxy and self.edge_local_loss_weight > 0:
+                    edge_local_loss = compute_edge_local_proxy_loss(
+                        pred_one, graph.y, graph
+                    )
+                    loss = loss + self.edge_local_loss_weight * edge_local_loss
+                    loss_dict["edge_local_proxy_loss"] = edge_local_loss
+                if self.log_zone_metrics:
+                    loss_dict.update(compute_zone_metrics(pred_one, graph.y, graph))
+                loss_dict["total_loss"] = loss
             return loss, loss_dict
         else:
             with autocast(device_type=self.dist.device.type, enabled=self.amp):
@@ -264,6 +293,17 @@ class MGNTrainer:
                     )
                     loss = loss + self.physics_loss_weight * phy_loss
                     loss_dict["physics_loss"] = phy_loss
+                if self.use_fidelity_zones and self.zone_loss_weight > 0:
+                    zone_loss = compute_zone_weighted_loss(pred, graph.y, graph)
+                    loss = loss + self.zone_loss_weight * zone_loss
+                    loss_dict["zone_loss"] = zone_loss
+                if self.use_edge_local_proxy and self.edge_local_loss_weight > 0:
+                    edge_local_loss = compute_edge_local_proxy_loss(pred, graph.y, graph)
+                    loss = loss + self.edge_local_loss_weight * edge_local_loss
+                    loss_dict["edge_local_proxy_loss"] = edge_local_loss
+                if self.log_zone_metrics:
+                    loss_dict.update(compute_zone_metrics(pred, graph.y, graph))
+                loss_dict["total_loss"] = loss
             return loss, loss_dict
 
     def backward(self, loss):
@@ -278,6 +318,12 @@ class MGNTrainer:
 
 @hydra.main(version_base="1.3", config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
+    if cfg.get("seed") is not None:
+        random.seed(cfg.seed)
+        np.random.seed(cfg.seed)
+        torch.manual_seed(cfg.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(cfg.seed)
     DistributedManager.initialize()
     dist = DistributedManager()
     initialize_wandb(
@@ -297,28 +343,30 @@ def main(cfg: DictConfig) -> None:
 
     for epoch in range(trainer.epoch_init, cfg.epochs):
         epoch_loss = 0.0
+        epoch_metrics = {}
         num_batches = 0
         for batch in trainer.dataloader:
             loss, loss_dict = trainer.train(batch)
             epoch_loss += loss.detach().item()
+            for key, value in loss_dict.items():
+                if torch.is_tensor(value):
+                    epoch_metrics[key] = (
+                        epoch_metrics.get(key, 0.0) + value.detach().item()
+                    )
             num_batches += 1
+            if cfg.get("max_train_batches") and num_batches >= cfg.max_train_batches:
+                break
 
         avg_loss = epoch_loss / num_batches if num_batches > 0 else float("inf")
+        avg_metrics = {
+            key: value / num_batches for key, value in epoch_metrics.items()
+        } if num_batches > 0 else {}
         rank_zero_logger.info(f"Epoch {epoch} completed. Average Loss: {avg_loss:.4e}")
+        for key in sorted(avg_metrics):
+            rank_zero_logger.info(f"Epoch {epoch} {key}: {avg_metrics[key]:.4e}")
 
-        wandb.log(
-            {
-                "total_loss": loss_dict["total_loss"].detach().cpu(),
-                "loss_one": loss_dict.get("loss_one", torch.tensor(0.0)).detach().cpu(),
-                "loss_stability": loss_dict.get("loss_stability", torch.tensor(0.0))
-                .detach()
-                .cpu(),
-                "physics_loss": loss_dict.get("physics_loss", torch.tensor(0.0))
-                .detach()
-                .cpu(),
-                "epoch": epoch,
-            }
-        )
+        log_data = {"epoch": epoch, **avg_metrics}
+        wandb.log(log_data)
 
         if dist.world_size > 1:
             torch.distributed.barrier()

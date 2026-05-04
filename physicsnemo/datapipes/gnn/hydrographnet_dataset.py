@@ -311,6 +311,10 @@ class HydroGraphDataset(Dataset):
         split: str = "train",
         rollout_length: Optional[int] = None,
         return_physics: bool = False,
+        use_fidelity_zones: bool = False,
+        zone_label_file: str = "zone_label.txt",
+        zone_weight_file: str = "zone_weight.txt",
+        return_edge_local: bool = False,
     ):
         if split not in {"train", "test"}:
             raise ValueError(f"Invalid split '{split}'. Expected 'train' or 'test'.")
@@ -329,14 +333,21 @@ class HydroGraphDataset(Dataset):
         # rollout_length is only used when split=="test"
         self.rollout_length = rollout_length if rollout_length is not None else 0
         self.return_physics = return_physics
+        self.use_fidelity_zones = use_fidelity_zones
+        self.zone_label_file = zone_label_file
+        self.zone_weight_file = zone_weight_file
+        self.return_edge_local = return_edge_local
 
         # Placeholders for static and dynamic data, indices, and normalization stats.
         self.static_data = {}
+        self.static_data_raw_xy = None
         self.dynamic_data = []
         self.sample_index = []
         self.hydrograph_ids = []
         self.static_stats = {}
         self.dynamic_stats = {}
+        self.zone_label = None
+        self.zone_weight = None
 
         self.process()
 
@@ -389,6 +400,9 @@ class HydroGraphDataset(Dataset):
             [(i, nbr) for i, nbrs in enumerate(neighbors) for nbr in nbrs if nbr != i]
         ).T
         edge_features = self.create_edge_features(xy_coords, edge_index)
+        edge_unit_vectors = self.create_edge_unit_vectors(
+            self.static_data_raw_xy, edge_index
+        )
 
         # Store static data.
         self.static_data = {
@@ -404,7 +418,10 @@ class HydroGraphDataset(Dataset):
             "infiltration": infiltration,
             "edge_index": edge_index,
             "edge_features": edge_features,
+            "edge_unit_vectors": edge_unit_vectors,
         }
+        if self.use_fidelity_zones:
+            self.zone_label, self.zone_weight = self.load_fidelity_zones(num_nodes)
 
         # Read hydrograph IDs either from a file or from the directory.
         if self.hydrograph_ids_file is not None:
@@ -437,6 +454,8 @@ class HydroGraphDataset(Dataset):
             (
                 water_depth,
                 inflow_hydrograph,
+                velocity_x,
+                velocity_y,
                 volume,
                 precipitation,
             ) = self.load_dynamic_data(
@@ -446,6 +465,8 @@ class HydroGraphDataset(Dataset):
                 {
                     "water_depth": water_depth,
                     "inflow_hydrograph": inflow_hydrograph,
+                    "velocity_x": velocity_x,
+                    "velocity_y": velocity_y,
                     "volume": volume,
                     "precipitation": precipitation,
                     "hydro_id": hid,
@@ -507,6 +528,8 @@ class HydroGraphDataset(Dataset):
                     self.dynamic_stats["inflow_hydrograph"]["mean"],
                     self.dynamic_stats["inflow_hydrograph"]["std"],
                 ),
+                "velocity_x": dyn["velocity_x"],
+                "velocity_y": dyn["velocity_y"],
                 "hydro_id": dyn["hydro_id"],
             }
             self.dynamic_data.append(dyn_std)
@@ -591,6 +614,22 @@ class HydroGraphDataset(Dataset):
             g.edge_attr = torch.tensor(sd["edge_features"], dtype=torch.float)
             g.x = torch.tensor(node_features, dtype=torch.float)
             g.y = torch.tensor(target, dtype=torch.float)
+            if self.use_fidelity_zones:
+                g.zone_label = torch.tensor(self.zone_label, dtype=torch.long)
+                g.zone_weight = torch.tensor(self.zone_weight, dtype=torch.float)
+            if self.return_edge_local:
+                g.edge_unit_vector = torch.tensor(
+                    sd["edge_unit_vectors"], dtype=torch.float
+                )
+                g.current_vx = torch.tensor(
+                    dyn["velocity_x"][prev_time, :], dtype=torch.float
+                )
+                g.current_vy = torch.tensor(
+                    dyn["velocity_y"][prev_time, :], dtype=torch.float
+                )
+                g.volume_std = torch.tensor(
+                    [self.dynamic_stats["volume"]["std"]], dtype=torch.float
+                )
 
             # Determine if physics data should be returned.
             need_physics = self.return_physics or (self.noise_type == "pushforward")
@@ -717,6 +756,16 @@ class HydroGraphDataset(Dataset):
             g = pyg.data.Data(edge_index=edges)
             g.edge_attr = torch.tensor(sd["edge_features"], dtype=torch.float)
             g.x = torch.tensor(node_features, dtype=torch.float)
+            if self.use_fidelity_zones:
+                g.zone_label = torch.tensor(self.zone_label, dtype=torch.long)
+                g.zone_weight = torch.tensor(self.zone_weight, dtype=torch.float)
+            if self.return_edge_local:
+                g.edge_unit_vector = torch.tensor(
+                    sd["edge_unit_vectors"], dtype=torch.float
+                )
+                g.volume_std = torch.tensor(
+                    [self.dynamic_stats["volume"]["std"]], dtype=torch.float
+                )
             rollout_data = {
                 "inflow": torch.tensor(
                     dyn["inflow_hydrograph"][
@@ -748,6 +797,27 @@ class HydroGraphDataset(Dataset):
     def __len__(self) -> int:
         """Return the number of samples in the dataset."""
         return self.length
+
+    def load_fidelity_zones(self, num_nodes: int) -> tuple[np.ndarray, np.ndarray]:
+        """Load node-level fidelity zone labels and local-loss weights."""
+        label_path = os.path.join(self.data_dir, self.zone_label_file)
+        weight_path = os.path.join(self.data_dir, self.zone_weight_file)
+        if not os.path.exists(label_path):
+            raise FileNotFoundError(f"Fidelity zone label file not found: {label_path}")
+        if not os.path.exists(weight_path):
+            raise FileNotFoundError(f"Fidelity zone weight file not found: {weight_path}")
+
+        zone_label = np.loadtxt(label_path, dtype=np.int64).reshape(-1)
+        zone_weight = np.loadtxt(weight_path, dtype=np.float32).reshape(-1)
+        if zone_label.shape[0] != num_nodes:
+            raise ValueError(
+                f"Expected {num_nodes} zone labels, found {zone_label.shape[0]}"
+            )
+        if zone_weight.shape[0] != num_nodes:
+            raise ValueError(
+                f"Expected {num_nodes} zone weights, found {zone_weight.shape[0]}"
+            )
+        return zone_label, zone_weight
 
     @staticmethod
     def normalize(
@@ -901,8 +971,9 @@ class HydroGraphDataset(Dataset):
         flow_accum_path = os.path.join(folder, f"{prefix}_FA.txt")
         infiltration_path = os.path.join(folder, f"{prefix}_IP.txt")
 
-        xy_coords = np.loadtxt(xy_path, delimiter="\t")
-        xy_coords = standardize(xy_coords, "xy_coords")
+        raw_xy_coords = np.loadtxt(xy_path, delimiter="\t")
+        self.static_data_raw_xy = raw_xy_coords
+        xy_coords = standardize(raw_xy_coords, "xy_coords")
         area_denorm = np.loadtxt(ca_path, delimiter="\t")[: xy_coords.shape[0]].reshape(
             -1, 1
         )
@@ -973,20 +1044,26 @@ class HydroGraphDataset(Dataset):
         wd_path = os.path.join(folder, f"{prefix}_WD_{hydrograph_id}.txt")
         inflow_path = os.path.join(folder, f"{prefix}_US_InF_{hydrograph_id}.txt")
         volume_path = os.path.join(folder, f"{prefix}_V_{hydrograph_id}.txt")
+        vx_path = os.path.join(folder, f"{prefix}_VX_{hydrograph_id}.txt")
+        vy_path = os.path.join(folder, f"{prefix}_VY_{hydrograph_id}.txt")
         precipitation_path = os.path.join(folder, f"{prefix}_Pr_{hydrograph_id}.txt")
         water_depth = np.loadtxt(wd_path, delimiter="\t")[skip::interval, :num_points]
         inflow_hydrograph = np.loadtxt(inflow_path, delimiter="\t")[skip::interval, 1]
         volume = np.loadtxt(volume_path, delimiter="\t")[skip::interval, :num_points]
+        velocity_x = np.loadtxt(vx_path, delimiter="\t")[skip::interval, :num_points]
+        velocity_y = np.loadtxt(vy_path, delimiter="\t")[skip::interval, :num_points]
         precipitation = np.loadtxt(precipitation_path, delimiter="\t")[skip::interval]
         # Limit data until 25 time steps after the peak inflow.
         peak_time_idx = np.argmax(inflow_hydrograph)
         water_depth = water_depth[: peak_time_idx + 25]
         volume = volume[: peak_time_idx + 25]
+        velocity_x = velocity_x[: peak_time_idx + 25]
+        velocity_y = velocity_y[: peak_time_idx + 25]
         precipitation = (
             precipitation[: peak_time_idx + 25] * 2.7778e-7
         )  # Unit conversion
         inflow_hydrograph = inflow_hydrograph[: peak_time_idx + 25]
-        return water_depth, inflow_hydrograph, volume, precipitation
+        return water_depth, inflow_hydrograph, velocity_x, velocity_y, volume, precipitation
 
     def create_node_features(
         self,
@@ -1092,3 +1169,12 @@ class HydroGraphDataset(Dataset):
         )
         distance = (distance - np.mean(distance)) / (np.std(distance) + epsilon)
         return np.hstack([relative_coords, distance[:, None]])
+
+    def create_edge_unit_vectors(
+        self, xy_coords: np.ndarray, edge_index: np.ndarray
+    ) -> np.ndarray:
+        """Create raw-coordinate unit vectors for directed local-flow proxies."""
+        row, col = edge_index
+        relative_coords = xy_coords[col] - xy_coords[row]
+        distance = np.linalg.norm(relative_coords, axis=1, keepdims=True)
+        return relative_coords / (distance + 1e-8)

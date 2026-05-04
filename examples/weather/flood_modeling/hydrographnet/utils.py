@@ -131,6 +131,90 @@ def compute_physics_loss(pred, physics_data, graph, delta_t=1200.0):
         return torch.tensor(0.0, device=pred.device)
 
 
+def compute_zone_weighted_loss(pred, target, graph):
+    """Compute a node-wise prediction loss weighted by fidelity-zone weights."""
+    if not hasattr(graph, "zone_weight"):
+        return torch.tensor(0.0, device=pred.device)
+    weights = graph.zone_weight.to(pred.device).view(-1, 1)
+    if torch.sum(weights) <= 0:
+        return torch.tensor(0.0, device=pred.device)
+    node_loss = (pred - target) ** 2
+    return torch.sum(weights * node_loss) / (torch.sum(weights) * pred.shape[1])
+
+
+def compute_edge_local_proxy_loss(pred, target, graph):
+    """Compute a selective velocity-proxy volume-change loss.
+
+    This is a separate bridge toward edge-informed local conservation. It uses
+    the current VX/VY field on each directed edge to build a transport proxy,
+    calibrates that proxy to the target volume delta for the current sample, and
+    applies the residual only through zone weights when available.
+    """
+    required_attrs = ("edge_unit_vector", "current_vx", "current_vy", "volume_std")
+    if not all(hasattr(graph, attr) for attr in required_attrs):
+        return torch.tensor(0.0, device=pred.device)
+
+    src, dst = graph.edge_index
+    edge_dirs = graph.edge_unit_vector.to(pred.device)
+    velocity = torch.stack([graph.current_vx, graph.current_vy], dim=1).to(pred.device)
+    edge_velocity = 0.5 * (velocity[src] + velocity[dst])
+    edge_flux = torch.sum(edge_velocity * edge_dirs, dim=1)
+
+    divergence = torch.zeros(pred.shape[0], device=pred.device)
+    divergence.index_add_(0, src, edge_flux)
+    divergence.index_add_(0, dst, -edge_flux)
+    proxy = -divergence
+
+    losses = []
+    unique_ids = torch.unique(graph.batch) if hasattr(graph, "batch") else [None]
+    for local_idx, uid in enumerate(unique_ids):
+        if uid is None:
+            node_mask = torch.ones(pred.shape[0], dtype=torch.bool, device=pred.device)
+            volume_std = graph.volume_std.reshape(-1)[0].to(pred.device)
+        else:
+            node_mask = graph.batch == uid
+            volume_std = graph.volume_std.reshape(-1)[local_idx].to(pred.device)
+
+        pred_delta = pred[node_mask, 1] * volume_std
+        target_delta = target[node_mask, 1] * volume_std
+        proxy_delta = proxy[node_mask]
+        denom = torch.sum(proxy_delta * proxy_delta).clamp_min(1e-12)
+        scale = (torch.sum(target_delta * proxy_delta) / denom).detach()
+        residual = pred_delta - scale * proxy_delta
+
+        if hasattr(graph, "zone_weight"):
+            weights = graph.zone_weight[node_mask].to(pred.device)
+            if torch.sum(weights) > 0:
+                losses.append(torch.sum(weights * residual**2) / torch.sum(weights))
+            else:
+                losses.append(torch.mean(residual**2))
+        else:
+            losses.append(torch.mean(residual**2))
+
+    return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=pred.device)
+
+
+def compute_zone_metrics(pred, target, graph, num_zones=4):
+    """Return per-zone RMSE metrics for water depth and volume differences."""
+    if not hasattr(graph, "zone_label"):
+        return {}
+
+    metrics = {}
+    labels = graph.zone_label.to(pred.device).view(-1)
+    err_sq = (pred - target) ** 2
+    for zone in range(num_zones):
+        mask = labels == zone
+        if torch.any(mask):
+            zone_err = err_sq[mask]
+            rmse = torch.sqrt(torch.mean(zone_err))
+            wd_rmse = torch.sqrt(torch.mean(zone_err[:, 0]))
+            volume_rmse = torch.sqrt(torch.mean(zone_err[:, 1]))
+            metrics[f"zone_{zone}_rmse"] = rmse
+            metrics[f"zone_{zone}_wd_rmse"] = wd_rmse
+            metrics[f"zone_{zone}_volume_rmse"] = volume_rmse
+    return metrics
+
+
 def custom_loss(pred, targets):
     """
     Compute a custom loss as the sum of MSE losses on water depth and volume predictions.
