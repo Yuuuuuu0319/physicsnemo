@@ -315,6 +315,7 @@ class HydroGraphDataset(Dataset):
         zone_label_file: str = "zone_label.txt",
         zone_weight_file: str = "zone_weight.txt",
         return_edge_local: bool = False,
+        norm_stats_dir: Optional[Union[str, Path]] = None,
     ):
         if split not in {"train", "test"}:
             raise ValueError(f"Invalid split '{split}'. Expected 'train' or 'test'.")
@@ -337,6 +338,7 @@ class HydroGraphDataset(Dataset):
         self.zone_label_file = zone_label_file
         self.zone_weight_file = zone_weight_file
         self.return_edge_local = return_edge_local
+        self.norm_stats_dir = str(norm_stats_dir) if norm_stats_dir is not None else None
 
         # Placeholders for static and dynamic data, indices, and normalization stats.
         self.static_data = {}
@@ -925,7 +927,8 @@ class HydroGraphDataset(Dataset):
         Returns:
             dict: Normalization statistics.
         """
-        filepath = os.path.join(self.data_dir, filename)
+        stats_dir = self.norm_stats_dir or self.data_dir
+        filepath = os.path.join(stats_dir, filename)
         with open(filepath, "r") as f:
             stats = json.load(f)
         return stats

@@ -204,3 +204,128 @@ Edge-proxy read:
 - This supports the research direction that the final local conservation term
   should use real HEC-RAS face connectivity / face flow instead of this rough
   kNN transport proxy.
+
+## True HGN_Test Evaluation And HEC-RAS Face Data Update
+
+New data now available:
+
+- Train dataset: `/mnt/8tb_hdd2/joyce/HGN_train` (`H1`-`H40`)
+- Test dataset: `/mnt/8tb_hdd2/joyce/HGN_test` (`H41`-`H50`)
+- HEC-RAS geometry: `/mnt/8tb_hdd2/joyce/Minxiong/Minxiong.g01`
+- HEC-RAS result HDF: `/mnt/8tb_hdd2/joyce/Minxiong/Minxiong.p03.hdf`
+
+The zone generation was updated to use midpoint thresholds between nominal
+square-cell areas for the HEC-RAS refinement regions `100`, `80`, `60`, `40`:
+
+| Zone | Nominal resolution | Nominal area | Rule | Weight | Node Count |
+|---:|---:|---:|---|---:|---:|
+| 0 | 100 | 10000 | `area >= 8200` | 0.0 | 6193 |
+| 1 | 80 | 6400 | `5000 <= area < 8200` | 0.25 | 3182 |
+| 2 | 60 | 3600 | `2600 <= area < 5000` | 0.5 | 2066 |
+| 3 | 40 | 1600 | `area < 2600` | 1.0 | 1274 |
+
+Generated/updated files:
+
+- `/mnt/8tb_hdd2/joyce/HGN_train/zone_label.txt`
+- `/mnt/8tb_hdd2/joyce/HGN_train/zone_weight.txt`
+- `/mnt/8tb_hdd2/joyce/HGN_train/zone_summary.json`
+- `/mnt/8tb_hdd2/joyce/HGN_test/zone_label.txt`
+- `/mnt/8tb_hdd2/joyce/HGN_test/zone_weight.txt`
+- `/mnt/8tb_hdd2/joyce/HGN_test/zone_summary.json`
+
+The HEC-RAS HDF was also used to extract a separate true-face graph. This is not
+mixed into the kNN edge proxy branch.
+
+Face graph files:
+
+- `/mnt/8tb_hdd2/joyce/Minxiong/hecras_hgn_face_graph.npz`
+- `/mnt/8tb_hdd2/joyce/Minxiong/hecras_hgn_face_graph_summary.json`
+
+Face graph summary:
+
+| Item | Value |
+|---|---:|
+| HGN nodes | 12715 |
+| HDF cells | 13429 |
+| HDF faces | 29347 |
+| Internal HGN faces | 28633 |
+| Boundary/ghost faces | 714 |
+| Face velocity shape | `239 x 29347` |
+| Max HGN/HDF coordinate distance | `6.79e-10` |
+
+Important interpretation:
+
+- `HGN_train/M80_XY.txt` and `HGN_test/M80_XY.txt` match the first `12715` HDF
+  cell centers exactly enough to use the same cell index order.
+- The additional `714` HDF cells appear as boundary/ghost-style cells and are
+  kept separate from the internal HGN face graph.
+- The HDF contains face velocity, but it is event-specific to `Minxiong.p03.hdf`;
+  it should only be used as a face-flow target when the HDF event matches the
+  evaluated hydrograph.
+
+### HGN_Test One-Step Evaluation
+
+One-step CSV: `results_zone_eval_hgn_test_seed0_h41h50.csv`
+
+| Checkpoint | MSE | Zone Loss | Zone 3 RMSE | Zone 3 WD RMSE | Zone 3 Volume RMSE |
+|---|---:|---:|---:|---:|---:|
+| baseline | 2.4745e-03 | 2.6465e-03 | 4.4385e-02 | 5.7550e-02 | 2.5054e-02 |
+| zone025 | 2.0643e-03 | 2.2955e-03 | 4.3048e-02 | 5.4389e-02 | 2.7344e-02 |
+| zone1 | 1.7078e-03 | 1.7882e-03 | 3.9546e-02 | 4.7989e-02 | 2.8707e-02 |
+| random | 1.6774e-03 | 1.8103e-03 | 3.9381e-02 | 4.8614e-02 | 2.7159e-02 |
+| full | 1.6803e-03 | 1.8166e-03 | 3.9406e-02 | 4.8757e-02 | 2.6976e-02 |
+| edgeproxy1e-6 | 2.3832e-03 | 2.1191e-03 | 4.3586e-02 | 5.3528e-02 | 3.0557e-02 |
+| edgeproxy1e-8 | 3.0251e-03 | 2.5153e-03 | 4.4605e-02 | 5.4384e-02 | 3.1955e-02 |
+
+### HGN_Test 10-Step Rollout Evaluation
+
+Rollout CSV: `results_zone_rollout_hgn_test_seed0_h41h50_len10.csv`
+
+| Checkpoint | Rollout RMSE | WD RMSE | Volume RMSE | Zone 3 Rollout RMSE | Zone 3 WD RMSE | Zone 3 Volume RMSE |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline | 2.3772e-01 | 3.0212e-01 | 1.4746e-01 | 2.0372e-01 | 2.5819e-01 | 1.2777e-01 |
+| zone025 | 2.1703e-01 | 2.6802e-01 | 1.4956e-01 | 1.9097e-01 | 2.3493e-01 | 1.3316e-01 |
+| zone1 | 2.0214e-01 | 2.4036e-01 | 1.5475e-01 | 1.7427e-01 | 2.0521e-01 | 1.3646e-01 |
+| random | 2.0085e-01 | 2.4745e-01 | 1.3945e-01 | 1.8012e-01 | 2.1817e-01 | 1.3148e-01 |
+| full | 2.0070e-01 | 2.4728e-01 | 1.3934e-01 | 1.7983e-01 | 2.1819e-01 | 1.3064e-01 |
+| edgeproxy1e-6 | 2.7619e-01 | 3.3228e-01 | 2.0528e-01 | 2.3010e-01 | 2.6992e-01 | 1.8157e-01 |
+| edgeproxy1e-8 | 2.8773e-01 | 3.6155e-01 | 1.8664e-01 | 2.2412e-01 | 2.4979e-01 | 1.9453e-01 |
+
+HGN_Test read:
+
+- `zone1` remains the best method for high-fidelity Zone 3 water-depth rollout.
+- `random` and `full` remain strongest for overall rollout and volume metrics.
+- The edge proxy branch remains weaker overall and should not be used as the
+  main method.
+- The next local-conservation branch should use the extracted HEC-RAS true-face
+  graph instead of kNN/VX/VY proxy edges.
+
+### HEC-RAS Face Residual Diagnostic
+
+Face residual CSV: `results_hecras_face_residual_hgn_test_seed0_h41h50_len10.csv`
+
+This diagnostic uses the extracted HEC-RAS face graph and the face velocity in
+`/mnt/8tb_hdd2/joyce/Minxiong/Minxiong.p03.hdf`. The command was intentionally
+kept separate from the model training and from the previous kNN/VX/VY edge proxy
+branch.
+
+Important caveat: `--matched-hdf-event` was not set, so these values should be
+treated as alignment/scale diagnostics only. They are not final physics metrics
+unless the HDF result event is confirmed to match the evaluated HGN hydrographs.
+
+| Checkpoint | Face proxy scale | GT-face residual RMSE | Pred-face residual RMSE | Pred-vs-GT delta RMSE | Zone 3 pred-face residual RMSE |
+|---|---:|---:|---:|---:|---:|
+| baseline | 2.6978e-03 | 2.9586e+03 | 6.1169e+02 | 3.4656e+03 | 5.4284e+02 |
+| zone1 | 2.7247e-03 | 3.1155e+03 | 6.1999e+02 | 3.6371e+03 | 5.5955e+02 |
+| random | 1.9178e-03 | 2.8202e+03 | 5.5714e+02 | 3.2773e+03 | 5.3785e+02 |
+| full | 1.9128e-03 | 2.8178e+03 | 5.5699e+02 | 3.2748e+03 | 5.3449e+02 |
+
+Diagnostic read:
+
+- `full` and `random` are closest on the face-residual diagnostic, which matches
+  their stronger HGN_Test rollout/volume behavior.
+- `zone1` is still the most useful high-fidelity Zone 3 water-depth weighting
+  result, but it does not dominate this face-residual diagnostic.
+- The next clean branch should consume `hecras_hgn_face_graph.npz` directly and
+  add an optional true-face local-conservation loss, without touching the
+  existing zone-weight-only branch.

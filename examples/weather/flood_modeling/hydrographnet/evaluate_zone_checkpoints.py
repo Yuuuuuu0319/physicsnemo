@@ -22,8 +22,10 @@ from utils import compute_zone_metrics, compute_zone_weighted_loss
 
 def evaluate_checkpoint(args, checkpoint_name: str, checkpoint_path: Path) -> dict:
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    eval_data_dir = args.test_data_dir or args.data_dir
+    norm_stats_dir = args.train_data_dir or args.data_dir
     dataset = HydroGraphDataset(
-        data_dir=args.data_dir,
+        data_dir=eval_data_dir,
         prefix=args.prefix,
         n_time_steps=args.n_time_steps,
         hydrograph_ids_file=args.eval_ids_file,
@@ -33,6 +35,7 @@ def evaluate_checkpoint(args, checkpoint_name: str, checkpoint_path: Path) -> di
         use_fidelity_zones=True,
         zone_label_file=args.zone_label_file,
         zone_weight_file=args.zone_weight_file,
+        norm_stats_dir=norm_stats_dir,
     )
 
     model = MeshGraphKAN(
@@ -79,8 +82,20 @@ def evaluate_checkpoint(args, checkpoint_name: str, checkpoint_path: Path) -> di
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", required=True)
-    parser.add_argument("--eval-ids-file", default="eval_h4_h6.txt")
+    parser.add_argument(
+        "--data-dir",
+        required=True,
+        help="Training data directory, or evaluation data directory when --test-data-dir is omitted.",
+    )
+    parser.add_argument(
+        "--train-data-dir",
+        help="Directory containing training normalization stats. Defaults to --data-dir.",
+    )
+    parser.add_argument(
+        "--test-data-dir",
+        help="Evaluation data directory. Use this for HGN_test while keeping train stats from HGN_train.",
+    )
+    parser.add_argument("--eval-ids-file", default="test.txt")
     parser.add_argument("--prefix", default="M80")
     parser.add_argument("--n-time-steps", type=int, default=2)
     parser.add_argument("--zone-label-file", default="zone_label.txt")
