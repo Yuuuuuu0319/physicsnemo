@@ -41,6 +41,8 @@ from physicsnemo.utils import load_checkpoint, save_checkpoint
 from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
 from utils import (
     compute_edge_local_proxy_loss,
+    compute_hecras_face_geometry_loss,
+    compute_hecras_face_local_loss,
     compute_physics_loss,
     compute_zone_metrics,
     compute_zone_weighted_loss,
@@ -80,6 +82,21 @@ class MGNTrainer:
         self.log_zone_metrics = cfg.get("log_zone_metrics", False)
         self.use_edge_local_proxy = cfg.get("use_edge_local_proxy", False)
         self.edge_local_loss_weight = cfg.get("edge_local_loss_weight", 0.0)
+        self.use_hecras_face_loss = cfg.get("use_hecras_face_loss", False)
+        self.hecras_face_loss_weight = cfg.get("hecras_face_loss_weight", 0.0)
+        self.hecras_face_zone_mode = cfg.get("hecras_face_zone_mode", "zone_weight")
+        self.hecras_face_calibrate_to_target = cfg.get(
+            "hecras_face_calibrate_to_target", True
+        )
+        self.use_hecras_face_geometry_loss = cfg.get(
+            "use_hecras_face_geometry_loss", False
+        )
+        self.hecras_face_geometry_loss_weight = cfg.get(
+            "hecras_face_geometry_loss_weight", 0.0
+        )
+        self.hecras_face_geometry_zone_mode = cfg.get(
+            "hecras_face_geometry_zone_mode", "zone_weight"
+        )
 
         # Set activation function.
         mlp_act = "relu"
@@ -107,6 +124,13 @@ class MGNTrainer:
             zone_label_file=cfg.get("zone_label_file", "zone_label.txt"),
             zone_weight_file=cfg.get("zone_weight_file", "zone_weight.txt"),
             return_edge_local=self.use_edge_local_proxy,
+            return_hecras_face=(
+                self.use_hecras_face_loss or self.use_hecras_face_geometry_loss
+            ),
+            hecras_face_graph_file=cfg.get("hecras_face_graph_file"),
+            hecras_face_velocity_file=cfg.get("hecras_face_velocity_file"),
+            hecras_face_velocity_path=cfg.get("hecras_face_velocity_path"),
+            hecras_face_time_offset=cfg.get("hecras_face_time_offset", 0),
         )
         sampler = DistributedSampler(
             dataset,
@@ -277,6 +301,32 @@ class MGNTrainer:
                     )
                     loss = loss + self.edge_local_loss_weight * edge_local_loss
                     loss_dict["edge_local_proxy_loss"] = edge_local_loss
+                if self.use_hecras_face_loss and self.hecras_face_loss_weight > 0:
+                    hecras_face_loss = compute_hecras_face_local_loss(
+                        pred_one,
+                        graph.y,
+                        graph,
+                        delta_t=self.delta_t,
+                        zone_mode=self.hecras_face_zone_mode,
+                        calibrate_to_target=self.hecras_face_calibrate_to_target,
+                    )
+                    loss = loss + self.hecras_face_loss_weight * hecras_face_loss
+                    loss_dict["hecras_face_loss"] = hecras_face_loss
+                if (
+                    self.use_hecras_face_geometry_loss
+                    and self.hecras_face_geometry_loss_weight > 0
+                ):
+                    hecras_face_geometry_loss = compute_hecras_face_geometry_loss(
+                        pred_one,
+                        graph,
+                        zone_mode=self.hecras_face_geometry_zone_mode,
+                    )
+                    loss = (
+                        loss
+                        + self.hecras_face_geometry_loss_weight
+                        * hecras_face_geometry_loss
+                    )
+                    loss_dict["hecras_face_geometry_loss"] = hecras_face_geometry_loss
                 if self.log_zone_metrics:
                     loss_dict.update(compute_zone_metrics(pred_one, graph.y, graph))
                 loss_dict["total_loss"] = loss
@@ -301,6 +351,32 @@ class MGNTrainer:
                     edge_local_loss = compute_edge_local_proxy_loss(pred, graph.y, graph)
                     loss = loss + self.edge_local_loss_weight * edge_local_loss
                     loss_dict["edge_local_proxy_loss"] = edge_local_loss
+                if self.use_hecras_face_loss and self.hecras_face_loss_weight > 0:
+                    hecras_face_loss = compute_hecras_face_local_loss(
+                        pred,
+                        graph.y,
+                        graph,
+                        delta_t=self.delta_t,
+                        zone_mode=self.hecras_face_zone_mode,
+                        calibrate_to_target=self.hecras_face_calibrate_to_target,
+                    )
+                    loss = loss + self.hecras_face_loss_weight * hecras_face_loss
+                    loss_dict["hecras_face_loss"] = hecras_face_loss
+                if (
+                    self.use_hecras_face_geometry_loss
+                    and self.hecras_face_geometry_loss_weight > 0
+                ):
+                    hecras_face_geometry_loss = compute_hecras_face_geometry_loss(
+                        pred,
+                        graph,
+                        zone_mode=self.hecras_face_geometry_zone_mode,
+                    )
+                    loss = (
+                        loss
+                        + self.hecras_face_geometry_loss_weight
+                        * hecras_face_geometry_loss
+                    )
+                    loss_dict["hecras_face_geometry_loss"] = hecras_face_geometry_loss
                 if self.log_zone_metrics:
                     loss_dict.update(compute_zone_metrics(pred, graph.y, graph))
                 loss_dict["total_loss"] = loss

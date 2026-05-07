@@ -194,6 +194,145 @@ def compute_edge_local_proxy_loss(pred, target, graph):
     return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=pred.device)
 
 
+def compute_hecras_face_local_loss(
+    pred,
+    target,
+    graph,
+    delta_t=1200.0,
+    zone_mode="zone_weight",
+    calibrate_to_target=True,
+):
+    """Compute selective local loss on HEC-RAS true internal faces.
+
+    This branch is intentionally separate from the kNN/VX/VY proxy loss. It uses
+    HEC-RAS internal face connectivity, face length, and optional HDF face
+    velocity. The HDF velocity is event-specific, so keep this loss disabled
+    unless the event mapping has been reviewed.
+    """
+    required_attrs = (
+        "hecras_face_index",
+        "hecras_face_length",
+        "hecras_face_velocity",
+        "volume_std",
+    )
+    if not all(hasattr(graph, attr) for attr in required_attrs):
+        return torch.tensor(0.0, device=pred.device)
+
+    face_index = graph.hecras_face_index.to(pred.device)
+    face_length = graph.hecras_face_length.to(pred.device).reshape(-1)
+    face_velocity = graph.hecras_face_velocity.to(pred.device).reshape(-1)
+    if face_index.numel() == 0 or face_length.numel() == 0:
+        return torch.tensor(0.0, device=pred.device)
+
+    src, dst = face_index
+    face_flow = face_velocity * face_length
+    face_delta = face_flow * delta_t
+    proxy = torch.zeros(pred.shape[0], dtype=pred.dtype, device=pred.device)
+    proxy.index_add_(0, src, -face_delta.to(pred.dtype))
+    proxy.index_add_(0, dst, face_delta.to(pred.dtype))
+
+    losses = []
+    batch = getattr(graph, "batch", None)
+    unique_ids = torch.unique(batch) if batch is not None else [None]
+    for local_idx, uid in enumerate(unique_ids):
+        if uid is None:
+            node_mask = torch.ones(pred.shape[0], dtype=torch.bool, device=pred.device)
+        else:
+            node_mask = batch == uid
+
+        volume_std = graph.volume_std.reshape(-1)[local_idx].to(pred.device)
+        pred_delta = pred[node_mask, 1] * volume_std
+        target_delta = target[node_mask, 1] * volume_std
+        proxy_delta = proxy[node_mask]
+
+        if calibrate_to_target:
+            denom = torch.sum(proxy_delta * proxy_delta).clamp_min(1e-12)
+            scale = (torch.sum(target_delta * proxy_delta) / denom).detach()
+            proxy_delta = proxy_delta * scale
+
+        residual = pred_delta - proxy_delta
+        weights = None
+        if zone_mode == "zone_weight" and hasattr(graph, "zone_weight"):
+            weights = graph.zone_weight[node_mask].to(pred.device)
+        elif zone_mode == "high" and hasattr(graph, "zone_label"):
+            weights = (graph.zone_label[node_mask].to(pred.device) == 3).to(pred.dtype)
+        elif zone_mode == "all":
+            weights = torch.ones_like(residual)
+
+        if weights is not None and torch.sum(weights) > 0:
+            losses.append(torch.sum(weights * residual**2) / torch.sum(weights))
+        else:
+            losses.append(torch.mean(residual**2))
+
+    return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=pred.device)
+
+
+def compute_hecras_face_geometry_loss(pred, graph, zone_mode="zone_weight"):
+    """Compute geometry-only smoothness on HEC-RAS true internal faces.
+
+    This loss does not use event-specific HDF face velocity. It regularizes the
+    predicted volume delta per cell area across true HEC-RAS internal faces,
+    weighted by face length and optionally by fidelity-zone weights.
+    """
+    required_attrs = (
+        "hecras_face_index",
+        "hecras_face_length",
+        "hecras_node_area",
+        "volume_std",
+    )
+    if not all(hasattr(graph, attr) for attr in required_attrs):
+        return torch.tensor(0.0, device=pred.device)
+
+    face_index = graph.hecras_face_index.to(pred.device)
+    face_length = graph.hecras_face_length.to(pred.device).reshape(-1)
+    node_area = graph.hecras_node_area.to(pred.device).reshape(-1).clamp_min(1e-6)
+    src, dst = face_index
+    if src.numel() == 0:
+        return torch.tensor(0.0, device=pred.device)
+
+    losses = []
+    batch = getattr(graph, "batch", None)
+    unique_ids = torch.unique(batch) if batch is not None else [None]
+    for local_idx, uid in enumerate(unique_ids):
+        if uid is None:
+            node_mask = torch.ones(pred.shape[0], dtype=torch.bool, device=pred.device)
+            face_mask = torch.ones(src.shape[0], dtype=torch.bool, device=pred.device)
+            node_offset = 0
+        else:
+            node_mask = batch == uid
+            node_ids = torch.nonzero(node_mask, as_tuple=False).reshape(-1)
+            node_offset = int(node_ids[0].detach().item())
+            face_mask = node_mask[src] & node_mask[dst]
+
+        if not torch.any(face_mask):
+            continue
+
+        volume_std = graph.volume_std.reshape(-1)[local_idx].to(pred.device)
+        pred_delta_per_area = pred[node_mask, 1] * volume_std / node_area[node_mask]
+        local_src = src[face_mask] - node_offset
+        local_dst = dst[face_mask] - node_offset
+        face_diff = pred_delta_per_area[local_src] - pred_delta_per_area[local_dst]
+
+        weights = face_length[face_mask].to(pred.dtype)
+        if zone_mode == "zone_weight" and hasattr(graph, "zone_weight"):
+            zone_weight = graph.zone_weight.to(pred.device)
+            edge_zone_weight = torch.maximum(zone_weight[src[face_mask]], zone_weight[dst[face_mask]])
+            weights = weights * edge_zone_weight.to(pred.dtype)
+        elif zone_mode == "high" and hasattr(graph, "zone_label"):
+            zone_label = graph.zone_label.to(pred.device)
+            high_mask = (zone_label[src[face_mask]] == 3) | (zone_label[dst[face_mask]] == 3)
+            weights = weights * high_mask.to(pred.dtype)
+        elif zone_mode != "all":
+            weights = weights * 0.0 + 1.0
+
+        if torch.sum(weights) > 0:
+            losses.append(torch.sum(weights * face_diff**2) / torch.sum(weights))
+        else:
+            losses.append(torch.mean(face_diff**2))
+
+    return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=pred.device)
+
+
 def compute_zone_metrics(pred, target, graph, num_zones=4):
     """Return per-zone RMSE metrics for water depth and volume differences."""
     if not hasattr(graph, "zone_label"):

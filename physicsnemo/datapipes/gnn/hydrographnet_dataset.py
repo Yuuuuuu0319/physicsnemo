@@ -315,6 +315,14 @@ class HydroGraphDataset(Dataset):
         zone_label_file: str = "zone_label.txt",
         zone_weight_file: str = "zone_weight.txt",
         return_edge_local: bool = False,
+        return_hecras_face: bool = False,
+        hecras_face_graph_file: Optional[Union[str, Path]] = None,
+        hecras_face_velocity_file: Optional[Union[str, Path]] = None,
+        hecras_face_velocity_path: str = (
+            "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/"
+            "2D Flow Areas/per2/Face Velocity"
+        ),
+        hecras_face_time_offset: int = 0,
         norm_stats_dir: Optional[Union[str, Path]] = None,
     ):
         if split not in {"train", "test"}:
@@ -338,6 +346,17 @@ class HydroGraphDataset(Dataset):
         self.zone_label_file = zone_label_file
         self.zone_weight_file = zone_weight_file
         self.return_edge_local = return_edge_local
+        self.return_hecras_face = return_hecras_face
+        self.hecras_face_graph_file = (
+            str(hecras_face_graph_file) if hecras_face_graph_file is not None else None
+        )
+        self.hecras_face_velocity_file = (
+            str(hecras_face_velocity_file)
+            if hecras_face_velocity_file is not None
+            else None
+        )
+        self.hecras_face_velocity_path = hecras_face_velocity_path
+        self.hecras_face_time_offset = hecras_face_time_offset
         self.norm_stats_dir = str(norm_stats_dir) if norm_stats_dir is not None else None
 
         # Placeholders for static and dynamic data, indices, and normalization stats.
@@ -350,6 +369,8 @@ class HydroGraphDataset(Dataset):
         self.dynamic_stats = {}
         self.zone_label = None
         self.zone_weight = None
+        self.hecras_face_graph = None
+        self.hecras_face_velocity = None
 
         self.process()
 
@@ -424,6 +445,10 @@ class HydroGraphDataset(Dataset):
         }
         if self.use_fidelity_zones:
             self.zone_label, self.zone_weight = self.load_fidelity_zones(num_nodes)
+        if self.return_hecras_face:
+            self.hecras_face_graph = self.load_hecras_face_graph(num_nodes)
+            if self.hecras_face_velocity_file is not None:
+                self.hecras_face_velocity = self.load_hecras_face_velocity()
 
         # Read hydrograph IDs either from a file or from the directory.
         if self.hydrograph_ids_file is not None:
@@ -632,6 +657,8 @@ class HydroGraphDataset(Dataset):
                 g.volume_std = torch.tensor(
                     [self.dynamic_stats["volume"]["std"]], dtype=torch.float
                 )
+            if self.return_hecras_face:
+                self.add_hecras_face_attrs(g, t_idx)
 
             # Determine if physics data should be returned.
             need_physics = self.return_physics or (self.noise_type == "pushforward")
@@ -768,6 +795,8 @@ class HydroGraphDataset(Dataset):
                 g.volume_std = torch.tensor(
                     [self.dynamic_stats["volume"]["std"]], dtype=torch.float
                 )
+            if self.return_hecras_face:
+                self.add_hecras_face_attrs(g, 0)
             rollout_data = {
                 "inflow": torch.tensor(
                     dyn["inflow_hydrograph"][
@@ -820,6 +849,81 @@ class HydroGraphDataset(Dataset):
                 f"Expected {num_nodes} zone weights, found {zone_weight.shape[0]}"
             )
         return zone_label, zone_weight
+
+    def load_hecras_face_graph(self, num_nodes: int) -> dict[str, np.ndarray]:
+        """Load HEC-RAS internal face connectivity aligned to HGN node order."""
+        if self.hecras_face_graph_file is None:
+            raise ValueError(
+                "return_hecras_face=True requires hecras_face_graph_file."
+            )
+        face_data = np.load(self.hecras_face_graph_file)
+        face_index = face_data["internal_face_index"].astype(np.int64)
+        face_length = face_data["internal_face_length"].astype(np.float32)
+        hdf_face_index = face_data["internal_hdf_face_index"].astype(np.int64)
+        if face_index.shape[0] != 2:
+            raise ValueError(
+                f"Expected HEC-RAS face index shape (2, F), got {face_index.shape}"
+            )
+        if face_index.size and int(face_index.max()) >= num_nodes:
+            raise ValueError(
+                "HEC-RAS face graph contains cell indices outside the HGN node count."
+            )
+        if face_length.shape[0] != face_index.shape[1]:
+            raise ValueError("HEC-RAS face length count does not match face count.")
+        if hdf_face_index.shape[0] != face_index.shape[1]:
+            raise ValueError("HEC-RAS HDF face index count does not match face count.")
+        return {
+            "face_index": face_index,
+            "face_length": face_length,
+            "hdf_face_index": hdf_face_index,
+        }
+
+    def load_hecras_face_velocity(self) -> np.ndarray:
+        """Load HEC-RAS face velocity time series from an HDF result file."""
+        try:
+            import h5py
+        except ImportError as exc:
+            raise ImportError(
+                "h5py is required when hecras_face_velocity_file is provided."
+            ) from exc
+
+        with h5py.File(self.hecras_face_velocity_file, "r") as hdf:
+            if self.hecras_face_velocity_path not in hdf:
+                raise KeyError(
+                    f"HEC-RAS face velocity path not found: {self.hecras_face_velocity_path}"
+                )
+            return hdf[self.hecras_face_velocity_path][:].astype(np.float32)
+
+    def add_hecras_face_attrs(self, graph, time_index: int) -> None:
+        """Attach HEC-RAS true-face attributes to a PyG graph sample."""
+        if self.hecras_face_graph is None:
+            return
+        graph.hecras_face_index = torch.tensor(
+            self.hecras_face_graph["face_index"], dtype=torch.long
+        )
+        graph.hecras_face_length = torch.tensor(
+            self.hecras_face_graph["face_length"], dtype=torch.float
+        )
+        graph.hecras_node_area = torch.tensor(
+            self.static_data["area_denorm"].reshape(-1), dtype=torch.float
+        )
+        graph.volume_std = torch.tensor(
+            [self.dynamic_stats["volume"]["std"]], dtype=torch.float
+        )
+
+        if self.hecras_face_velocity is not None:
+            hdf_time_index = time_index + self.hecras_face_time_offset
+            if hdf_time_index < 0 or hdf_time_index >= self.hecras_face_velocity.shape[0]:
+                raise IndexError(
+                    f"HEC-RAS face velocity time index {hdf_time_index} is outside "
+                    f"0..{self.hecras_face_velocity.shape[0] - 1}"
+                )
+            graph.hecras_face_velocity = torch.tensor(
+                self.hecras_face_velocity[
+                    hdf_time_index, self.hecras_face_graph["hdf_face_index"]
+                ],
+                dtype=torch.float,
+            )
 
     @staticmethod
     def normalize(

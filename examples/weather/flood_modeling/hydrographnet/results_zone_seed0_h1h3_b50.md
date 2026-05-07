@@ -329,3 +329,138 @@ Diagnostic read:
 - The next clean branch should consume `hecras_hgn_face_graph.npz` directly and
   add an optional true-face local-conservation loss, without touching the
   existing zone-weight-only branch.
+
+### HEC-RAS True-Face Loss Smoke Branch
+
+Code branch:
+
+- `use_hecras_face_loss`
+- `hecras_face_loss_weight`
+- `hecras_face_graph_file`
+- `hecras_face_velocity_file`
+- `hecras_face_zone_mode`
+- `hecras_face_calibrate_to_target`
+
+This branch is separate from `edge_local_proxy`. It uses the extracted HEC-RAS
+internal face graph and optional HDF face velocity to build a selected-zone
+face residual during training. It remains disabled by default because
+`Minxiong.p03.hdf` event matching is not yet confirmed.
+
+Short training:
+
+| Checkpoint | Train hydrographs | Batches | Face loss weight | Avg total loss | Avg HEC-RAS face loss | Zone 3 WD train RMSE |
+|---|---|---:|---:|---:|---:|---:|
+| hecrasface1e-10 | H1-H3 | 50 | 1e-10 | 1.3506e-01 | 9.7852e+06 | 9.6588e-02 |
+
+HGN_Test one-step CSV: `results_hecrasface_eval_hgn_test_seed0_h41h50.csv`
+
+| Checkpoint | MSE | Zone Loss | Zone 3 RMSE | Zone 3 WD RMSE | Zone 3 Volume RMSE |
+|---|---:|---:|---:|---:|---:|
+| hecrasface1e-10 | 2.4802e-03 | 2.6558e-03 | 4.4483e-02 | 5.7827e-02 | 2.4763e-02 |
+
+HGN_Test rollout CSV: `results_hecrasface_rollout_hgn_test_seed0_h41h50_len10.csv`
+
+| Checkpoint | Rollout RMSE | WD RMSE | Volume RMSE | Zone 3 Rollout RMSE | Zone 3 WD RMSE | Zone 3 Volume RMSE |
+|---|---:|---:|---:|---:|---:|---:|
+| hecrasface1e-10 | 2.3799e-01 | 3.0327e-01 | 1.4593e-01 | 2.0369e-01 | 2.5886e-01 | 1.2631e-01 |
+
+HEC-RAS face diagnostic CSV:
+`results_hecrasface_face_residual_hgn_test_seed0_h41h50_len10.csv`
+
+| Checkpoint | Face proxy scale | GT-face residual RMSE | Pred-face residual RMSE | Pred-vs-GT delta RMSE | Zone 3 pred-face residual RMSE |
+|---|---:|---:|---:|---:|---:|
+| hecrasface1e-10 | 2.6892e-03 | 2.9304e+03 | 6.0458e+02 | 3.4298e+03 | 5.3681e+02 |
+
+Current read:
+
+- The new true-face training path is technically wired and GPU-trainable.
+- With `hecras_face_loss_weight=1e-10`, rollout accuracy is close to baseline
+  and does not beat `zone1`.
+- Face residual diagnostic improves slightly versus baseline
+  (`611.7 -> 604.6`, Zone 3 `542.8 -> 536.8`), but this is still diagnostic,
+  not a final physics result.
+- The next useful experiment is not simply increasing the loss weight; first
+  confirm HDF event matching or switch to a geometry-only residual that does not
+  rely on event-specific face velocity.
+
+### HEC-RAS / HGN Event Matching Check
+
+Event match CSV: `results_hecras_hgn_event_match.csv`
+
+Event match report: `results_hecras_hgn_event_match.md`
+
+Tool:
+
+- `match_hecras_hgn_events.py`
+
+Key result:
+
+| Check | Result |
+|---|---:|
+| HGN hydrographs checked | 50 |
+| HGN hydrographs exactly matching HDF `result_upstreamBC1` | 50 |
+| Max abs diff for `result_upstreamBC1` | 5.0022e-10 |
+| HGN precipitation files checked | 50 |
+| HGN precipitation nonzero files | 0 |
+| HDF event precipitation max | 1.0 |
+
+Interpretation:
+
+- The HDF result upstream boundary condition `upstreamBC1` matches every HGN
+  `M80_US_InF_H*.txt` file exactly within numerical tolerance.
+- This means boundary inflow alone cannot identify a unique HGN hydrograph
+  event; H1-H50 appear to share the same upstream inflow template.
+- HGN precipitation files are all zero, while the HDF event precipitation is
+  nonzero. Because of this mismatch, `Minxiong.p03.hdf` face velocity should
+  still be treated as a diagnostic target unless the precipitation/source setup
+  is reconciled.
+- A safer next branch is geometry-only true-face regularization, or obtaining
+  event-specific HDF outputs that match each HGN hydrograph's full forcing and
+  state trajectory.
+
+### HEC-RAS Geometry-Only True-Face Regularization
+
+Code branch:
+
+- `use_hecras_face_geometry_loss`
+- `hecras_face_geometry_loss_weight`
+- `hecras_face_geometry_zone_mode`
+
+This branch only uses the extracted HEC-RAS internal face connectivity, face
+length, and cell area. It does not use event-specific HDF face velocity, so it
+is safer than `use_hecras_face_loss` when HDF precipitation/forcing does not
+fully match HGN.
+
+The loss regularizes predicted volume delta per cell area across true HEC-RAS
+internal faces, with optional fidelity-zone weighting.
+
+Short training:
+
+| Checkpoint | Train hydrographs | Batches | Geometry loss weight | Device | Avg total loss | Avg geometry loss | Zone 3 WD train RMSE |
+|---|---|---:|---:|---|---:|---:|---:|
+| hecrasgeom1e-3 | H1-H3 | 50 | 1e-3 | CPU | 1.3441e-01 | 3.7201e-01 | 9.6484e-02 |
+
+HGN_Test one-step CSV: `results_hecrasgeom_eval_hgn_test_seed0_h41h50.csv`
+
+| Checkpoint | MSE | Zone Loss | Zone 3 RMSE | Zone 3 WD RMSE | Zone 3 Volume RMSE |
+|---|---:|---:|---:|---:|---:|
+| hecrasgeom1e-3 | 2.4759e-03 | 2.6521e-03 | 4.4428e-02 | 5.7661e-02 | 2.4953e-02 |
+
+HGN_Test rollout CSV: `results_hecrasgeom_rollout_hgn_test_seed0_h41h50_len10.csv`
+
+| Checkpoint | Rollout RMSE | WD RMSE | Volume RMSE | Zone 3 Rollout RMSE | Zone 3 WD RMSE | Zone 3 Volume RMSE |
+|---|---:|---:|---:|---:|---:|---:|
+| hecrasgeom1e-3 | 2.3776e-01 | 3.0237e-01 | 1.4705e-01 | 2.0366e-01 | 2.5833e-01 | 1.2727e-01 |
+
+Current read:
+
+- Geometry-only true-face regularization is wired, trainable, and avoids the
+  HDF face-velocity event mismatch.
+- With `hecras_face_geometry_loss_weight=1e-3`, HGN_Test rollout remains close
+  to baseline and does not beat `zone1`.
+- This branch is a safer base for later experiments than event-specific face
+  velocity loss, but it still needs stronger design to become a useful local
+  conservation method.
+- The short training/evaluation was run on CPU because GPU 1 was full during
+  this experiment; repeat on GPU when resources are available before treating
+  timing as comparable.

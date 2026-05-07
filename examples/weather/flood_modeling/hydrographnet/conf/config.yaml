@@ -64,6 +64,25 @@ log_zone_metrics: false
 use_edge_local_proxy: false
 edge_local_loss_weight: 0.0
 
+# HEC-RAS true-face branch. This is separate from the kNN/VX/VY proxy branch.
+# Keep it disabled unless the HEC-RAS HDF face-velocity event mapping has been
+# reviewed for the selected HydroGraphNet hydrographs.
+use_hecras_face_loss: false
+hecras_face_loss_weight: 0.0
+hecras_face_graph_file: null
+hecras_face_velocity_file: null
+hecras_face_velocity_path: "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/2D Flow Areas/per2/Face Velocity"
+hecras_face_time_offset: 0
+hecras_face_zone_mode: zone_weight  # zone_weight, high, or all
+hecras_face_calibrate_to_target: true
+
+# Geometry-only HEC-RAS true-face regularization. This uses only true face
+# connectivity, face length, and cell area; it does not consume event-specific
+# HDF face velocity, so it is safer when HDF forcing does not fully match HGN.
+use_hecras_face_geometry_loss: false
+hecras_face_geometry_loss_weight: 0.0
+hecras_face_geometry_zone_mode: zone_weight  # zone_weight, high, or all
+
 # Performance and optimization configurations.
 use_apex: True            # Use NVIDIA Apex for mixed precision if available.
 amp: False                # Automatic mixed precision flag.
