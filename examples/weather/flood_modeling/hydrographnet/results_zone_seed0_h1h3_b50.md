@@ -464,3 +464,125 @@ Current read:
 - The short training/evaluation was run on CPU because GPU 1 was full during
   this experiment; repeat on GPU when resources are available before treating
   timing as comparable.
+
+### Wet/High-Zone Geometry-Only True-Face Regularization
+
+Motivation:
+
+- The current HGN precipitation (`Pr`) files are all zero and are expected to be
+  updated later.
+- The current infiltration (`IP`) files are also all zero and are being
+  corrected separately.
+- Because those source-term inputs are not final, this branch intentionally does
+  not use precipitation or infiltration as local conservation terms.
+- Instead, it improves the safer geometry-only true-face branch by adding:
+  - a wet/dry face mask from current water depth;
+  - a `high_adjacent` zone mode that applies only to faces touching Zone 3.
+
+Code/config branch:
+
+- `hecras_face_geometry_zone_mode=high_adjacent`
+- `hecras_face_geometry_wet_depth_threshold=0.0`
+- `hecras_face_geometry_loss_weight=1e-4`
+
+Short training:
+
+| Checkpoint | Train hydrographs | Batches | Geometry loss weight | Zone mode | Wet depth threshold | Device | Avg total loss | Avg geometry loss | Zone 3 WD train RMSE |
+|---|---|---:|---:|---|---:|---|---:|---:|---:|
+| hecrasgeom_wet_high1e-4 | H1-H3 | 50 | 1e-4 | high_adjacent | 0.0 | GPU 1 | 1.3417e-01 | 9.4341e-01 | 9.6508e-02 |
+
+HGN_Test one-step CSV: `results_hecrasgeom_wet_high_eval_hgn_test_seed0_h41h50.csv`
+
+| Checkpoint | MSE | Zone Loss | Zone 3 RMSE | Zone 3 WD RMSE | Zone 3 Volume RMSE |
+|---|---:|---:|---:|---:|---:|
+| hecrasgeom_wet_high1e-4 | 2.4755e-03 | 2.6477e-03 | 4.4369e-02 | 5.7547e-02 | 2.5006e-02 |
+
+HGN_Test rollout CSV: `results_hecrasgeom_wet_high_rollout_hgn_test_seed0_h41h50_len10.csv`
+
+| Checkpoint | Rollout RMSE | WD RMSE | Volume RMSE | Zone 3 Rollout RMSE | Zone 3 WD RMSE | Zone 3 Volume RMSE |
+|---|---:|---:|---:|---:|---:|---:|
+| hecrasgeom_wet_high1e-4 | 2.3782e-01 | 3.0230e-01 | 1.4738e-01 | 2.0368e-01 | 2.5820e-01 | 1.2759e-01 |
+
+Current read:
+
+- The wet/high-adjacent branch is wired, GPU trainable, and does not depend on
+  unfinished `Pr` or `IP` source-term files.
+- The HGN_Test rollout is still close to baseline and does not beat `zone1`.
+- This is a cleaner experimental base for future selective local conservation
+  than the earlier all-face geometry-only branch, but the loss still needs more
+  physics before it can become the final method.
+
+### Wet/High-Zone Geometry Sweep
+
+Loss-weight sweep, fixed `hecras_face_geometry_zone_mode=high_adjacent` and
+`hecras_face_geometry_wet_depth_threshold=0.0`.
+
+One-step CSV: `results_hecrasgeom_wet_high_weight_sweep_eval_hgn_test_seed0_h41h50.csv`
+
+Rollout CSV: `results_hecrasgeom_wet_high_weight_sweep_rollout_hgn_test_seed0_h41h50_len10.csv`
+
+| Checkpoint | Weight | One-step MSE | One-step Zone 3 WD RMSE | Rollout RMSE | Rollout WD RMSE | Rollout Volume RMSE | Rollout Zone 3 WD RMSE | Rollout Zone 3 Volume RMSE |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| hecrasgeom_wet_high1e-5 | 1e-5 | 2.4756e-03 | 5.7550e-02 | 2.3777e-01 | 3.0215e-01 | 1.4754e-01 | 2.5821e-01 | 1.2780e-01 |
+| hecrasgeom_wet_high1e-4 | 1e-4 | 2.4755e-03 | 5.7547e-02 | 2.3782e-01 | 3.0230e-01 | 1.4738e-01 | 2.5820e-01 | 1.2759e-01 |
+| hecrasgeom_wet_high1e-3 | 1e-3 | 2.4813e-03 | 5.7811e-02 | 2.3784e-01 | 3.0286e-01 | 1.4633e-01 | 2.5817e-01 | 1.2659e-01 |
+
+Wet-threshold sweep, fixed `hecras_face_geometry_loss_weight=1e-4` and
+`hecras_face_geometry_zone_mode=high_adjacent`.
+
+One-step CSV: `results_hecrasgeom_wet_threshold_sweep_eval_hgn_test_seed0_h41h50.csv`
+
+Rollout CSV: `results_hecrasgeom_wet_threshold_sweep_rollout_hgn_test_seed0_h41h50_len10.csv`
+
+| Checkpoint | Wet threshold | One-step MSE | One-step Zone 3 WD RMSE | Rollout RMSE | Rollout WD RMSE | Rollout Volume RMSE | Rollout Zone 3 WD RMSE | Rollout Zone 3 Volume RMSE |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| wet0_high1e-4 | 0.0 | 2.4755e-03 | 5.7547e-02 | 2.3782e-01 | 3.0230e-01 | 1.4738e-01 | 2.5820e-01 | 1.2759e-01 |
+| wet001_high1e-4 | 0.01 | 2.4747e-03 | 5.7559e-02 | 2.3777e-01 | 3.0226e-01 | 1.4733e-01 | 2.5821e-01 | 1.2759e-01 |
+| wet005_high1e-4 | 0.05 | 2.4743e-03 | 5.7557e-02 | 2.3775e-01 | 3.0222e-01 | 1.4735e-01 | 2.5819e-01 | 1.2762e-01 |
+
+Sweep read:
+
+- The sweep confirms this branch is stable across these small weights and wet
+  thresholds.
+- `1e-3` slightly improves Zone 3 rollout volume but worsens one-step MSE and
+  rollout WD, so it is not clearly better.
+- `wet_depth_threshold=0.05` gives the best overall rollout among the threshold
+  sweep, but the gain is tiny.
+- None of the wet/high-adjacent settings beats the existing `zone1` result.
+- Until PR/IP files are finalized, this branch should remain a safe diagnostic
+  or scaffold for future local conservation rather than the main result.
+
+### Target-Gradient True-Face Geometry Branch
+
+Motivation:
+
+- The earlier geometry-only branch smooths predicted volume delta per area
+  across true faces.
+- Smoothing is safe but can erase physically meaningful local gradients.
+- `hecras_face_geometry_reference_mode=target_gradient` instead matches the
+  target cross-face volume-delta gradient from HGN labels. This still avoids
+  PR/IP source terms and HDF face velocity, but gives the loss a supervised
+  local spatial reference.
+
+Code/config branch:
+
+- `hecras_face_geometry_reference_mode=target_gradient`
+- `hecras_face_geometry_zone_mode=high_adjacent`
+- `hecras_face_geometry_wet_depth_threshold=0.05`
+- `hecras_face_geometry_loss_weight=1e-4`
+
+HGN_Test one-step CSV: `results_hecrasgeom_targetgrad_eval_hgn_test_seed0_h41h50.csv`
+
+HGN_Test rollout CSV: `results_hecrasgeom_targetgrad_rollout_hgn_test_seed0_h41h50_len10.csv`
+
+| Checkpoint | One-step MSE | One-step Zone 3 WD RMSE | Rollout RMSE | Rollout WD RMSE | Rollout Volume RMSE | Rollout Zone 3 WD RMSE | Rollout Zone 3 Volume RMSE |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| targetgrad_wet005_high1e-4 | 2.4745e-03 | 5.7556e-02 | 2.3776e-01 | 3.0224e-01 | 1.4732e-01 | 2.5819e-01 | 1.2760e-01 |
+
+Current read:
+
+- Target-gradient loss is wired and trainable.
+- Compared with smooth `wet005_high1e-4`, it very slightly improves Zone 3 WD
+  rollout but is not meaningfully different overall.
+- This is conceptually cleaner than pure smoothing, but still not enough to
+  beat `zone1` in the current short-training setup.

@@ -81,7 +81,9 @@ hecras_face_calibrate_to_target: true
 # HDF face velocity, so it is safer when HDF forcing does not fully match HGN.
 use_hecras_face_geometry_loss: false
 hecras_face_geometry_loss_weight: 0.0
-hecras_face_geometry_zone_mode: zone_weight  # zone_weight, high, or all
+hecras_face_geometry_zone_mode: zone_weight  # zone_weight, high/high_adjacent, or all
+hecras_face_geometry_wet_depth_threshold: null  # physical water depth threshold; null disables wet/dry masking
+hecras_face_geometry_reference_mode: smooth  # smooth or target_gradient
 
 # Performance and optimization configurations.
 use_apex: True            # Use NVIDIA Apex for mixed precision if available.

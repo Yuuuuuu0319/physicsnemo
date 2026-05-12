@@ -267,12 +267,25 @@ def compute_hecras_face_local_loss(
     return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=pred.device)
 
 
-def compute_hecras_face_geometry_loss(pred, graph, zone_mode="zone_weight"):
+def compute_hecras_face_geometry_loss(
+    pred,
+    graph,
+    target=None,
+    zone_mode="zone_weight",
+    wet_depth_threshold=None,
+    reference_mode="smooth",
+):
     """Compute geometry-only smoothness on HEC-RAS true internal faces.
 
     This loss does not use event-specific HDF face velocity. It regularizes the
     predicted volume delta per cell area across true HEC-RAS internal faces,
-    weighted by face length and optionally by fidelity-zone weights.
+    weighted by face length and optionally by fidelity-zone weights. The
+    default reference mode is smoothing. The target-gradient mode instead
+    matches the target cross-face volume-delta gradient, which avoids forcing
+    all neighboring cells toward the same update. When wet_depth_threshold is
+    set, only faces touching currently wet cells are regularized; this keeps
+    the branch independent of unfinished precipitation or infiltration
+    source-term files.
     """
     required_attrs = (
         "hecras_face_index",
@@ -311,24 +324,51 @@ def compute_hecras_face_geometry_loss(pred, graph, zone_mode="zone_weight"):
         pred_delta_per_area = pred[node_mask, 1] * volume_std / node_area[node_mask]
         local_src = src[face_mask] - node_offset
         local_dst = dst[face_mask] - node_offset
-        face_diff = pred_delta_per_area[local_src] - pred_delta_per_area[local_dst]
+        pred_face_diff = (
+            pred_delta_per_area[local_src] - pred_delta_per_area[local_dst]
+        )
+        if reference_mode == "target_gradient" and target is not None:
+            target_delta_per_area = (
+                target[node_mask, 1].to(pred.device) * volume_std / node_area[node_mask]
+            )
+            target_face_diff = (
+                target_delta_per_area[local_src] - target_delta_per_area[local_dst]
+            ).detach()
+            face_residual = pred_face_diff - target_face_diff
+        else:
+            face_residual = pred_face_diff
 
         weights = face_length[face_mask].to(pred.dtype)
         if zone_mode == "zone_weight" and hasattr(graph, "zone_weight"):
             zone_weight = graph.zone_weight.to(pred.device)
-            edge_zone_weight = torch.maximum(zone_weight[src[face_mask]], zone_weight[dst[face_mask]])
+            edge_zone_weight = torch.maximum(
+                zone_weight[src[face_mask]], zone_weight[dst[face_mask]]
+            )
             weights = weights * edge_zone_weight.to(pred.dtype)
-        elif zone_mode == "high" and hasattr(graph, "zone_label"):
+        elif zone_mode in ("high", "high_adjacent") and hasattr(graph, "zone_label"):
             zone_label = graph.zone_label.to(pred.device)
-            high_mask = (zone_label[src[face_mask]] == 3) | (zone_label[dst[face_mask]] == 3)
+            high_mask = (zone_label[src[face_mask]] == 3) | (
+                zone_label[dst[face_mask]] == 3
+            )
             weights = weights * high_mask.to(pred.dtype)
         elif zone_mode != "all":
             weights = weights * 0.0 + 1.0
 
+        if wet_depth_threshold is not None and hasattr(graph, "current_water_depth"):
+            current_wd = graph.current_water_depth.to(pred.device).reshape(-1)
+            if hasattr(graph, "water_depth_mean") and hasattr(graph, "water_depth_std"):
+                wd_mean = graph.water_depth_mean.reshape(-1)[local_idx].to(pred.device)
+                wd_std = graph.water_depth_std.reshape(-1)[local_idx].to(pred.device)
+                current_wd = current_wd * wd_std + wd_mean
+            edge_wet = torch.maximum(
+                current_wd[src[face_mask]], current_wd[dst[face_mask]]
+            ) > wet_depth_threshold
+            weights = weights * edge_wet.to(pred.dtype)
+
         if torch.sum(weights) > 0:
-            losses.append(torch.sum(weights * face_diff**2) / torch.sum(weights))
-        else:
-            losses.append(torch.mean(face_diff**2))
+            losses.append(torch.sum(weights * face_residual**2) / torch.sum(weights))
+        elif wet_depth_threshold is None and zone_mode not in ("high", "high_adjacent"):
+            losses.append(torch.mean(face_residual**2))
 
     return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=pred.device)
 

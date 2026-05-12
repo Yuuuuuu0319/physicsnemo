@@ -97,6 +97,12 @@ class MGNTrainer:
         self.hecras_face_geometry_zone_mode = cfg.get(
             "hecras_face_geometry_zone_mode", "zone_weight"
         )
+        self.hecras_face_geometry_wet_depth_threshold = cfg.get(
+            "hecras_face_geometry_wet_depth_threshold", None
+        )
+        self.hecras_face_geometry_reference_mode = cfg.get(
+            "hecras_face_geometry_reference_mode", "smooth"
+        )
 
         # Set activation function.
         mlp_act = "relu"
@@ -319,7 +325,12 @@ class MGNTrainer:
                     hecras_face_geometry_loss = compute_hecras_face_geometry_loss(
                         pred_one,
                         graph,
+                        target=graph.y,
                         zone_mode=self.hecras_face_geometry_zone_mode,
+                        wet_depth_threshold=(
+                            self.hecras_face_geometry_wet_depth_threshold
+                        ),
+                        reference_mode=self.hecras_face_geometry_reference_mode,
                     )
                     loss = (
                         loss
@@ -369,7 +380,12 @@ class MGNTrainer:
                     hecras_face_geometry_loss = compute_hecras_face_geometry_loss(
                         pred,
                         graph,
+                        target=graph.y,
                         zone_mode=self.hecras_face_geometry_zone_mode,
+                        wet_depth_threshold=(
+                            self.hecras_face_geometry_wet_depth_threshold
+                        ),
+                        reference_mode=self.hecras_face_geometry_reference_mode,
                     )
                     loss = (
                         loss

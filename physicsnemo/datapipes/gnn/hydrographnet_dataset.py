@@ -658,6 +658,15 @@ class HydroGraphDataset(Dataset):
                     [self.dynamic_stats["volume"]["std"]], dtype=torch.float
                 )
             if self.return_hecras_face:
+                g.current_water_depth = torch.tensor(
+                    dyn["water_depth"][prev_time, :], dtype=torch.float
+                )
+                g.water_depth_mean = torch.tensor(
+                    [self.dynamic_stats["water_depth"]["mean"]], dtype=torch.float
+                )
+                g.water_depth_std = torch.tensor(
+                    [self.dynamic_stats["water_depth"]["std"]], dtype=torch.float
+                )
                 self.add_hecras_face_attrs(g, t_idx)
 
             # Determine if physics data should be returned.
@@ -796,6 +805,15 @@ class HydroGraphDataset(Dataset):
                     [self.dynamic_stats["volume"]["std"]], dtype=torch.float
                 )
             if self.return_hecras_face:
+                g.current_water_depth = torch.tensor(
+                    dyn["water_depth"][self.n_time_steps - 1, :], dtype=torch.float
+                )
+                g.water_depth_mean = torch.tensor(
+                    [self.dynamic_stats["water_depth"]["mean"]], dtype=torch.float
+                )
+                g.water_depth_std = torch.tensor(
+                    [self.dynamic_stats["water_depth"]["std"]], dtype=torch.float
+                )
                 self.add_hecras_face_attrs(g, 0)
             rollout_data = {
                 "inflow": torch.tensor(
