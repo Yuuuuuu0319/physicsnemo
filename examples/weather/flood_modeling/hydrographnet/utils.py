@@ -271,6 +271,7 @@ def compute_hecras_face_geometry_loss(
     pred,
     graph,
     target=None,
+    delta_t=1200.0,
     zone_mode="zone_weight",
     wet_depth_threshold=None,
     reference_mode="smooth",
@@ -282,10 +283,11 @@ def compute_hecras_face_geometry_loss(
     weighted by face length and optionally by fidelity-zone weights. The
     default reference mode is smoothing. The target-gradient mode instead
     matches the target cross-face volume-delta gradient, which avoids forcing
-    all neighboring cells toward the same update. When wet_depth_threshold is
-    set, only faces touching currently wet cells are regularized; this keeps
-    the branch independent of unfinished precipitation or infiltration
-    source-term files.
+    all neighboring cells toward the same update. Source-aware modes subtract
+    the node-wise precipitation/IP source term before comparing cross-face
+    gradients, which keeps rainfall and infiltration from being regularized as
+    if they were transport. When wet_depth_threshold is set, only faces touching
+    currently wet cells are regularized.
     """
     required_attrs = (
         "hecras_face_index",
@@ -321,16 +323,31 @@ def compute_hecras_face_geometry_loss(
             continue
 
         volume_std = graph.volume_std.reshape(-1)[local_idx].to(pred.device)
-        pred_delta_per_area = pred[node_mask, 1] * volume_std / node_area[node_mask]
+        pred_delta = pred[node_mask, 1] * volume_std
+        target_delta = (
+            target[node_mask, 1].to(pred.device) * volume_std
+            if target is not None
+            else None
+        )
+        if reference_mode.startswith("source_") and hasattr(graph, "local_source_rate"):
+            source_delta = (
+                graph.local_source_rate[node_mask].to(pred.device) * delta_t
+            )
+            pred_delta = pred_delta - source_delta
+            if target_delta is not None:
+                target_delta = target_delta - source_delta
+
+        pred_delta_per_area = pred_delta / node_area[node_mask]
         local_src = src[face_mask] - node_offset
         local_dst = dst[face_mask] - node_offset
         pred_face_diff = (
             pred_delta_per_area[local_src] - pred_delta_per_area[local_dst]
         )
-        if reference_mode == "target_gradient" and target is not None:
-            target_delta_per_area = (
-                target[node_mask, 1].to(pred.device) * volume_std / node_area[node_mask]
-            )
+        if (
+            reference_mode in ("target_gradient", "source_target_gradient")
+            and target_delta is not None
+        ):
+            target_delta_per_area = target_delta / node_area[node_mask]
             target_face_diff = (
                 target_delta_per_area[local_src] - target_delta_per_area[local_dst]
             ).detach()

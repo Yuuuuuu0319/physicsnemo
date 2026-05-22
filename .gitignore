@@ -176,6 +176,9 @@ outputs/
 multirun/
 .hydra/
 
+# HydroGraphNet local generated datasets / HEC-RAS-derived data
+examples/weather/flood_modeling/hydrographnet/data_minxiong_from_hecras/
+
 # SLURM
 slurm-*.out
 sbatch_logs/

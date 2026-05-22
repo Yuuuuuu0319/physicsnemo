@@ -667,6 +667,10 @@ class HydroGraphDataset(Dataset):
                 g.water_depth_std = torch.tensor(
                     [self.dynamic_stats["water_depth"]["std"]], dtype=torch.float
                 )
+                g.local_source_rate = torch.tensor(
+                    self.compute_local_source_rate(dyn, prev_time, target_time),
+                    dtype=torch.float,
+                )
                 self.add_hecras_face_attrs(g, t_idx)
 
             # Determine if physics data should be returned.
@@ -814,6 +818,12 @@ class HydroGraphDataset(Dataset):
                 g.water_depth_std = torch.tensor(
                     [self.dynamic_stats["water_depth"]["std"]], dtype=torch.float
                 )
+                g.local_source_rate = torch.tensor(
+                    self.compute_local_source_rate(
+                        dyn, self.n_time_steps - 1, self.n_time_steps
+                    ),
+                    dtype=torch.float,
+                )
                 self.add_hecras_face_attrs(g, 0)
             rollout_data = {
                 "inflow": torch.tensor(
@@ -942,6 +952,31 @@ class HydroGraphDataset(Dataset):
                 ],
                 dtype=torch.float,
             )
+
+    def compute_local_source_rate(
+        self, dyn: dict[str, np.ndarray], prev_time: int, target_time: int
+    ) -> np.ndarray:
+        """Estimate node-wise source volume rate from precipitation and IP.
+
+        The HydroGraphNet precipitation values are normalized after converting to
+        m/s. `M80_IP` is treated consistently with the existing global physics
+        loss, where infiltration is used as a percentage multiplier.
+        """
+        prev_precip = dyn["precipitation"][prev_time]
+        target_precip = dyn["precipitation"][target_time]
+        avg_precip_norm = 0.5 * (prev_precip + target_precip)
+        avg_precip = self.denormalize(
+            avg_precip_norm,
+            self.dynamic_stats["precipitation"]["mean"],
+            self.dynamic_stats["precipitation"]["std"],
+        )
+        infiltration = self.denormalize(
+            self.static_data["infiltration"],
+            self.static_stats["infiltration"]["mean"],
+            self.static_stats["infiltration"]["std"],
+        ).reshape(-1)
+        area = self.static_data["area_denorm"].reshape(-1)
+        return avg_precip * area * (infiltration / 100.0)
 
     @staticmethod
     def normalize(

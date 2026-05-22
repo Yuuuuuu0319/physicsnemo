@@ -326,6 +326,7 @@ class MGNTrainer:
                         pred_one,
                         graph,
                         target=graph.y,
+                        delta_t=self.delta_t,
                         zone_mode=self.hecras_face_geometry_zone_mode,
                         wet_depth_threshold=(
                             self.hecras_face_geometry_wet_depth_threshold
@@ -381,6 +382,7 @@ class MGNTrainer:
                         pred,
                         graph,
                         target=graph.y,
+                        delta_t=self.delta_t,
                         zone_mode=self.hecras_face_geometry_zone_mode,
                         wet_depth_threshold=(
                             self.hecras_face_geometry_wet_depth_threshold
