@@ -81,7 +81,39 @@ def set_checkpoint_fn(do_checkpointing: bool) -> Callable:
 
 if PYG_AVAILABLE:
     pyg_data = importlib.import_module("torch_geometric.data")
-    torch_scatter = importlib.import_module("torch_scatter")
+    try:
+        torch_scatter = importlib.import_module("torch_scatter")
+    except (ImportError, OSError):
+        class _TorchScatterFallback:
+            """Small torch_scatter.scatter fallback for sum/mean dim=0 reductions."""
+
+            @staticmethod
+            def scatter(
+                src: Tensor,
+                index: Tensor,
+                dim: int = 0,
+                dim_size: int | None = None,
+                reduce: str = "sum",
+            ) -> Tensor:
+                if dim != 0:
+                    raise ValueError("Fallback scatter only supports dim=0.")
+                if reduce not in {"sum", "add", "mean"}:
+                    raise ValueError(
+                        "Fallback scatter only supports sum/add/mean reductions."
+                    )
+                if dim_size is None:
+                    dim_size = int(index.max().item()) + 1 if index.numel() else 0
+                out_shape = (dim_size, *src.shape[1:])
+                out = src.new_zeros(out_shape)
+                out.index_add_(0, index.long(), src)
+                if reduce == "mean":
+                    counts = src.new_zeros((dim_size,))
+                    counts.index_add_(0, index.long(), src.new_ones(index.numel()))
+                    view_shape = (dim_size,) + (1,) * (src.dim() - 1)
+                    out = out / counts.clamp_min(1).view(view_shape)
+                return out
+
+        torch_scatter = _TorchScatterFallback()
     PyGData = pyg_data.Data
     PyGHeteroData = pyg_data.HeteroData
 

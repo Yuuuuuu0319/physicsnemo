@@ -37,6 +37,7 @@ import logging
 import math
 import os
 import random
+import re
 import sys
 import tarfile
 import zipfile
@@ -318,6 +319,7 @@ class HydroGraphDataset(Dataset):
         return_hecras_face: bool = False,
         hecras_face_graph_file: Optional[Union[str, Path]] = None,
         hecras_face_velocity_file: Optional[Union[str, Path]] = None,
+        hecras_face_velocity_glob: Optional[str] = None,
         hecras_face_velocity_path: str = (
             "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/"
             "2D Flow Areas/per2/Face Velocity"
@@ -355,6 +357,7 @@ class HydroGraphDataset(Dataset):
             if hecras_face_velocity_file is not None
             else None
         )
+        self.hecras_face_velocity_glob = hecras_face_velocity_glob
         self.hecras_face_velocity_path = hecras_face_velocity_path
         self.hecras_face_time_offset = hecras_face_time_offset
         self.norm_stats_dir = str(norm_stats_dir) if norm_stats_dir is not None else None
@@ -371,6 +374,7 @@ class HydroGraphDataset(Dataset):
         self.zone_weight = None
         self.hecras_face_graph = None
         self.hecras_face_velocity = None
+        self.hecras_face_velocity_by_hydrograph = {}
 
         self.process()
 
@@ -449,6 +453,10 @@ class HydroGraphDataset(Dataset):
             self.hecras_face_graph = self.load_hecras_face_graph(num_nodes)
             if self.hecras_face_velocity_file is not None:
                 self.hecras_face_velocity = self.load_hecras_face_velocity()
+            if self.hecras_face_velocity_glob is not None:
+                self.hecras_face_velocity_by_hydrograph = (
+                    self.load_hecras_face_velocity_by_hydrograph()
+                )
 
         # Read hydrograph IDs either from a file or from the directory.
         if self.hydrograph_ids_file is not None:
@@ -671,7 +679,7 @@ class HydroGraphDataset(Dataset):
                     self.compute_local_source_rate(dyn, prev_time, target_time),
                     dtype=torch.float,
                 )
-                self.add_hecras_face_attrs(g, t_idx)
+                self.add_hecras_face_attrs(g, t_idx, self.hydrograph_ids[hydro_idx])
 
             # Determine if physics data should be returned.
             need_physics = self.return_physics or (self.noise_type == "pushforward")
@@ -824,7 +832,7 @@ class HydroGraphDataset(Dataset):
                     ),
                     dtype=torch.float,
                 )
-                self.add_hecras_face_attrs(g, 0)
+                self.add_hecras_face_attrs(g, 0, self.hydrograph_ids[idx])
             rollout_data = {
                 "inflow": torch.tensor(
                     dyn["inflow_hydrograph"][
@@ -922,7 +930,61 @@ class HydroGraphDataset(Dataset):
                 )
             return hdf[self.hecras_face_velocity_path][:].astype(np.float32)
 
-    def add_hecras_face_attrs(self, graph, time_index: int) -> None:
+    def load_hecras_face_velocity_by_hydrograph(self) -> dict[str, np.ndarray]:
+        """Load event-specific face velocity arrays keyed by hydrograph ID."""
+        try:
+            import h5py
+        except ImportError as exc:
+            raise ImportError(
+                "h5py is required when hecras_face_velocity_glob is provided."
+            ) from exc
+
+        if self.hecras_face_velocity_glob.startswith("/"):
+            matched_files = sorted(Path("/").glob(self.hecras_face_velocity_glob[1:]))
+        else:
+            matched_files = sorted(Path().glob(self.hecras_face_velocity_glob))
+        if not matched_files:
+            raise FileNotFoundError(
+                f"No HEC-RAS face velocity HDFs matched: {self.hecras_face_velocity_glob}"
+            )
+
+        velocity_by_hydrograph = {}
+        for hdf_path in matched_files:
+            hydrograph_id = None
+            for part in reversed(hdf_path.parts):
+                match = re.fullmatch(r"plan([HT]\d+)", part, flags=re.IGNORECASE)
+                if match is not None:
+                    hydrograph_id = match.group(1).upper()
+                    break
+            if hydrograph_id is None:
+                for part in reversed(hdf_path.parts):
+                    match = re.fullmatch(r"([HT]\d+)", part, flags=re.IGNORECASE)
+                    if match is not None:
+                        hydrograph_id = match.group(1).upper()
+                        break
+            if hydrograph_id is None:
+                raise ValueError(
+                    "Could not infer hydrograph ID from HDF path. Expected a path "
+                    f"containing planH1/H1/T1, got: {hdf_path}"
+                )
+            if hydrograph_id in velocity_by_hydrograph:
+                raise ValueError(
+                    f"Multiple HEC-RAS HDF files map to hydrograph {hydrograph_id}."
+                )
+            with h5py.File(hdf_path, "r") as hdf:
+                if self.hecras_face_velocity_path not in hdf:
+                    raise KeyError(
+                        "HEC-RAS face velocity path not found in "
+                        f"{hdf_path}: {self.hecras_face_velocity_path}"
+                    )
+                velocity_by_hydrograph[hydrograph_id] = hdf[
+                    self.hecras_face_velocity_path
+                ][:].astype(np.float32)
+        return velocity_by_hydrograph
+
+    def add_hecras_face_attrs(
+        self, graph, time_index: int, hydrograph_id: Optional[str] = None
+    ) -> None:
         """Attach HEC-RAS true-face attributes to a PyG graph sample."""
         if self.hecras_face_graph is None:
             return
@@ -939,15 +1001,25 @@ class HydroGraphDataset(Dataset):
             [self.dynamic_stats["volume"]["std"]], dtype=torch.float
         )
 
-        if self.hecras_face_velocity is not None:
+        face_velocity = self.hecras_face_velocity
+        if hydrograph_id is not None and self.hecras_face_velocity_by_hydrograph:
+            face_velocity = self.hecras_face_velocity_by_hydrograph.get(hydrograph_id)
+            if face_velocity is None:
+                available = ", ".join(sorted(self.hecras_face_velocity_by_hydrograph))
+                raise KeyError(
+                    f"No HEC-RAS face velocity HDF loaded for {hydrograph_id}. "
+                    f"Available hydrographs: {available}"
+                )
+
+        if face_velocity is not None:
             hdf_time_index = time_index + self.hecras_face_time_offset
-            if hdf_time_index < 0 or hdf_time_index >= self.hecras_face_velocity.shape[0]:
+            if hdf_time_index < 0 or hdf_time_index >= face_velocity.shape[0]:
                 raise IndexError(
                     f"HEC-RAS face velocity time index {hdf_time_index} is outside "
-                    f"0..{self.hecras_face_velocity.shape[0] - 1}"
+                    f"0..{face_velocity.shape[0] - 1}"
                 )
             graph.hecras_face_velocity = torch.tensor(
-                self.hecras_face_velocity[
+                face_velocity[
                     hdf_time_index, self.hecras_face_graph["hdf_face_index"]
                 ],
                 dtype=torch.float,

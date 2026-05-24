@@ -1,0 +1,5 @@
+experiment,hecras_face_loss_weight,max_train_batches,train_total_loss,train_mse_loss,train_physics_loss,train_hecras_face_loss,rollout10_pred_face_residual_rmse,rollout10_zone3_pred_face_residual_rmse,rollout30_pred_face_residual_rmse,rollout30_zone3_pred_face_residual_rmse,checkpoint,notes
+h1h6_b150,1e-10,150,0.044122,0.0067553,0.037000,3667600,580.4238774617513,495.29524790445964,,,checkpoints_hgn_h1h6_hecrasface_b150,Short matched-HDF training smoke/baseline run.
+h1h6_b600,1e-10,600,0.016981,0.0030215,0.013807,1528700,424.93423512776695,390.1945164998372,426.9333528306749,403.4925548977322,checkpoints_hgn_h1h6_hecrasface_b600,Longer matched-HDF run with default face-loss weight.
+h1h6_noface_b600,0,600,0.016859,0.0030341,0.013825,,437.06608225504556,424.9349395751953,445.7402162339952,444.9690450032552,checkpoints_hgn_h1h6_noface_b600,Matched-HDF evaluation baseline trained without HEC-RAS face loss.
+h1h6_w1e9_b600,1e-9,600,0.018126,0.0029674,0.013721,1437400,388.72288970947267,312.5126419067383,378.258194647895,310.21620313856334,checkpoints_hgn_h1h6_hecrasface_w1e9_b600,Best residual result so far among current H1-H6 experiments.

@@ -6,7 +6,9 @@
 This is an inspection tool for deciding whether an HEC-RAS result HDF can be
 used as an event-specific face-velocity source for HydroGraphNet training.
 It compares HDF boundary-condition time series with HGN `M80_US_InF_H*.txt`
-and optional precipitation files.
+and optional precipitation files. A single HDF can be checked with
+``--hdf-file``; generated event output folders can be scanned with
+``--hdf-glob``.
 """
 
 import argparse
@@ -138,6 +140,29 @@ def discover_hydrographs(data_dirs: list[Path], prefix: str) -> dict[str, Path]:
     return dict(sorted(hydrographs.items(), key=lambda item: hydrograph_sort_key(item[0])))
 
 
+def discover_precipitations(data_dirs: list[Path], prefix: str) -> dict[str, Path]:
+    precipitations = {}
+    for data_dir in data_dirs:
+        for path in data_dir.glob(f"{prefix}_Pr_H*.txt"):
+            hid = path.stem.split("_")[-1]
+            precipitations[hid] = path
+    return dict(
+        sorted(precipitations.items(), key=lambda item: hydrograph_sort_key(item[0]))
+    )
+
+
+def discover_hdf_files(hdf_files: list[Path] | None, hdf_globs: list[str] | None) -> list[Path]:
+    paths = []
+    for hdf_file in hdf_files or []:
+        paths.append(hdf_file)
+    for pattern in hdf_globs or []:
+        paths.extend(Path().glob(pattern) if not pattern.startswith("/") else Path("/").glob(pattern[1:]))
+    unique_paths = sorted({path.resolve() for path in paths if path.suffix.lower() == ".hdf"})
+    if not unique_paths:
+        raise FileNotFoundError("No HEC-RAS HDF files were found.")
+    return unique_paths
+
+
 def summarize_hgn_precipitation(data_dirs: list[Path], prefix: str) -> dict[str, float]:
     maxima = []
     nonzero_files = 0
@@ -159,15 +184,15 @@ def summarize_hgn_precipitation(data_dirs: list[Path], prefix: str) -> dict[str,
 
 def write_markdown_summary(
     output_md: Path,
-    hdf_file: Path,
+    hdf_files: list[Path],
     rows: list[dict[str, object]],
     top_n: int,
-    hdf_precip_max: float | None,
     hgn_precip_summary: dict[str, float],
 ) -> None:
     best = sorted(
         rows,
         key=lambda row: (
+            row["compare_kind"] != "inflow",
             row["series_name"] != "result_upstreamBC1",
             -float(row["corr"]),
             float(row["nrmse_z"]),
@@ -175,22 +200,42 @@ def write_markdown_summary(
         ),
     )[:top_n]
     exact_rows = [
-        row for row in rows if row["series_name"] == "result_upstreamBC1"
+        row for row in rows if row["compare_kind"] == "inflow"
+        and row["series_name"] == "result_upstreamBC1"
         and float(row["exact_or_close"]) > 0.5
     ]
+    best_precip = sorted(
+        [row for row in rows if row["compare_kind"] == "precipitation"],
+        key=lambda row: (-float(row["corr"]), float(row["nrmse_z"]), abs(float(row["peak_index_diff"]))),
+    )[:top_n]
     lines = [
         "# HEC-RAS / HGN Event Match Report",
         "",
-        f"HDF file: `{hdf_file}`",
+        f"HDF files checked: `{len(hdf_files)}`",
         "",
-        "## Best Matches",
+        "## Best Inflow Matches",
         "",
-        "| HGN ID | Split | HDF series | Corr | z-NRMSE | Max abs diff | Peak index diff | Exact/close |",
-        "|---|---|---|---:|---:|---:|---:|---:|",
+        "| HDF file | HGN ID | Split | HDF series | Corr | z-NRMSE | Max abs diff | Peak index diff | Exact/close |",
+        "|---|---|---|---|---:|---:|---:|---:|---:|",
     ]
     for row in best:
         lines.append(
-            "| {hydrograph_id} | {split} | {series_name} | {corr:.6f} | "
+            "| {hdf_file} | {hydrograph_id} | {split} | {series_name} | {corr:.6f} | "
+            "{nrmse_z:.6e} | {max_abs_diff:.6e} | {peak_index_diff} | "
+            "{exact_or_close:.0f} |".format(**row)
+        )
+    lines.extend(
+        [
+            "",
+            "## Best Precipitation Matches",
+            "",
+            "| HDF file | HGN ID | Split | Corr | z-NRMSE | Max abs diff | Peak index diff | Exact/close |",
+            "|---|---|---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in best_precip:
+        lines.append(
+            "| {hdf_file} | {hydrograph_id} | {split} | {corr:.6f} | "
             "{nrmse_z:.6e} | {max_abs_diff:.6e} | {peak_index_diff} | "
             "{exact_or_close:.0f} |".format(**row)
         )
@@ -210,14 +255,12 @@ def write_markdown_summary(
             "",
             "## Precipitation Check",
             "",
-            f"- HDF event precipitation max: `{hdf_precip_max}`",
             f"- HGN precipitation files checked: `{hgn_precip_summary['file_count']}`",
             f"- HGN precipitation nonzero files: `{hgn_precip_summary['nonzero_files']}`",
             f"- HGN precipitation max abs: `{hgn_precip_summary['max_abs']}`",
             "",
-            "If HDF precipitation is nonzero while all HGN precipitation files are zero, "
-            "the upstream boundary can still match exactly, but the HDF face velocity "
-            "should not yet be treated as a fully matched event-specific target.",
+            "A usable event-specific HDF face-velocity target should match both the "
+            "upstream forcing and the precipitation timing/shape for the selected HGN event.",
         ]
     )
     output_md.write_text("\n".join(lines) + "\n")
@@ -225,7 +268,12 @@ def write_markdown_summary(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hdf-file", required=True, type=Path)
+    parser.add_argument("--hdf-file", action="append", type=Path)
+    parser.add_argument(
+        "--hdf-glob",
+        action="append",
+        help="Glob pattern for generated event HDFs, e.g. '/path/outputs/planH*/Minxiong.p01.hdf'.",
+    )
     parser.add_argument("--data-dir", action="append", required=True, type=Path)
     parser.add_argument("--prefix", default="M80")
     parser.add_argument("--output-csv", required=True, type=Path)
@@ -236,38 +284,61 @@ def main() -> None:
     hydrographs = discover_hydrographs(args.data_dir, args.prefix)
     if not hydrographs:
         raise FileNotFoundError("No HGN upstream inflow files were found.")
-
-    hdf_series = {}
-    hdf_precip_max = None
-    with h5py.File(args.hdf_file, "r") as hdf:
-        for name, path in DEFAULT_SERIES.items():
-            if path in hdf:
-                hdf_series[name] = read_hdf_series(hdf, path)
-        if HDF_PRECIP_PATH in hdf:
-            hdf_precip = read_hdf_series(hdf, HDF_PRECIP_PATH)
-            hdf_precip_max = float(np.max(np.abs(hdf_precip)))
+    precipitations = discover_precipitations(args.data_dir, args.prefix)
+    hdf_files = discover_hdf_files(args.hdf_file, args.hdf_glob)
 
     rows = []
-    for hid, hgn_path in hydrographs.items():
-        hgn = load_hgn_series(hgn_path)
-        split = hgn_path.parent.name
-        for series_name, series_values in hdf_series.items():
-            metrics = compare_series(series_values, hgn)
-            rows.append(
-                {
-                    "hydrograph_id": hid,
-                    "split": split,
-                    "hgn_file": str(hgn_path),
-                    "series_name": series_name,
-                    "hgn_length": hgn.shape[0],
-                    "hdf_length": series_values.shape[0],
-                    **metrics,
-                }
-            )
+    for hdf_file in hdf_files:
+        hdf_series = {}
+        hdf_precip = None
+        with h5py.File(hdf_file, "r") as hdf:
+            for name, path in DEFAULT_SERIES.items():
+                if path in hdf:
+                    hdf_series[name] = read_hdf_series(hdf, path)
+            if HDF_PRECIP_PATH in hdf:
+                hdf_precip = read_hdf_series(hdf, HDF_PRECIP_PATH)
+
+        for hid, hgn_path in hydrographs.items():
+            hgn = load_hgn_series(hgn_path)
+            split = hgn_path.parent.name
+            for series_name, series_values in hdf_series.items():
+                metrics = compare_series(series_values, hgn)
+                rows.append(
+                    {
+                        "hdf_file": str(hdf_file),
+                        "hydrograph_id": hid,
+                        "split": split,
+                        "compare_kind": "inflow",
+                        "hgn_file": str(hgn_path),
+                        "series_name": series_name,
+                        "hgn_length": hgn.shape[0],
+                        "hdf_length": series_values.shape[0],
+                        **metrics,
+                    }
+                )
+            precip_path = precipitations.get(hid)
+            if hdf_precip is not None and precip_path is not None:
+                hgn_precip = load_hgn_series(precip_path)
+                metrics = compare_series(hdf_precip, hgn_precip)
+                rows.append(
+                    {
+                        "hdf_file": str(hdf_file),
+                        "hydrograph_id": hid,
+                        "split": precip_path.parent.name,
+                        "compare_kind": "precipitation",
+                        "hgn_file": str(precip_path),
+                        "series_name": HDF_PRECIP_PATH,
+                        "hgn_length": hgn_precip.shape[0],
+                        "hdf_length": hdf_precip.shape[0],
+                        **metrics,
+                    }
+                )
 
     fieldnames = [
+        "hdf_file",
         "hydrograph_id",
         "split",
+        "compare_kind",
         "series_name",
         "hgn_length",
         "hdf_length",
@@ -294,20 +365,24 @@ def main() -> None:
         args.output_md.parent.mkdir(parents=True, exist_ok=True)
         write_markdown_summary(
             args.output_md,
-            args.hdf_file,
+            hdf_files,
             rows,
             args.top_n,
-            hdf_precip_max,
             summarize_hgn_precipitation(args.data_dir, args.prefix),
         )
 
     best = sorted(
         rows,
-        key=lambda row: (-float(row["corr"]), float(row["nrmse_z"]), float(row["max_abs_diff"])),
+        key=lambda row: (
+            row["compare_kind"] != "inflow",
+            -float(row["corr"]),
+            float(row["nrmse_z"]),
+            float(row["max_abs_diff"]),
+        ),
     )[: args.top_n]
     for row in best:
         print(
-            "{hydrograph_id} {split} {series_name} corr={corr:.6f} "
+            "{hdf_file} {hydrograph_id} {split} {compare_kind} {series_name} corr={corr:.6f} "
             "nrmse_z={nrmse_z:.3e} max_abs={max_abs_diff:.3e} exact={exact_or_close:.0f}".format(
                 **row
             )

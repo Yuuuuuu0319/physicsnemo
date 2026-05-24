@@ -17,6 +17,8 @@ or treat the result strictly as an alignment/scale diagnostic.
 
 import argparse
 import csv
+import glob
+import re
 from pathlib import Path
 
 import h5py
@@ -55,6 +57,48 @@ def load_face_graph(path: Path, device: torch.device) -> dict[str, torch.Tensor]
             data["internal_face_length"], dtype=torch.float32, device=device
         ),
     }
+
+
+def infer_hydrograph_id_from_path(path: Path) -> str:
+    """Infer H1/T1 style HydroGraphNet event ID from a HEC-RAS output path."""
+    for part in reversed(path.parts):
+        match = re.fullmatch(r"plan([HT]\d+)", part, flags=re.IGNORECASE)
+        if match is not None:
+            return match.group(1).upper()
+    for part in reversed(path.parts):
+        match = re.fullmatch(r"([HT]\d+)", part, flags=re.IGNORECASE)
+        if match is not None:
+            return match.group(1).upper()
+    raise ValueError(
+        "Could not infer hydrograph ID from HDF path. Expected a path containing "
+        f"planH1/H1/T1, got: {path}"
+    )
+
+
+def load_face_velocity(path: Path, device: torch.device) -> torch.Tensor:
+    with h5py.File(path, "r") as hdf:
+        face_velocity_np = hdf[FACE_VELOCITY_PATH][:]
+    return torch.tensor(face_velocity_np, dtype=torch.float32, device=device)
+
+
+def load_face_velocity_by_hydrograph(
+    hdf_glob: str, device: torch.device
+) -> dict[str, torch.Tensor]:
+    hdf_paths = sorted(Path(path) for path in glob.glob(hdf_glob))
+    if not hdf_paths:
+        raise FileNotFoundError(f"No HEC-RAS HDFs matched --hdf-glob: {hdf_glob}")
+
+    face_velocity_by_hydrograph = {}
+    for hdf_path in hdf_paths:
+        hydrograph_id = infer_hydrograph_id_from_path(hdf_path)
+        if hydrograph_id in face_velocity_by_hydrograph:
+            raise ValueError(
+                f"Multiple HEC-RAS HDF files map to hydrograph {hydrograph_id}."
+            )
+        face_velocity_by_hydrograph[hydrograph_id] = load_face_velocity(
+            hdf_path, device
+        )
+    return face_velocity_by_hydrograph
 
 
 def face_delta_proxy(
@@ -122,9 +166,14 @@ def evaluate_checkpoint(args, checkpoint_name: str, checkpoint_path: Path) -> di
         norm_stats_dir=norm_stats_dir,
     )
     face_graph = load_face_graph(args.face_graph_file, device)
-    with h5py.File(args.hdf_file, "r") as hdf:
-        face_velocity_np = hdf[FACE_VELOCITY_PATH][:]
-    face_velocity = torch.tensor(face_velocity_np, dtype=torch.float32, device=device)
+    face_velocity = None
+    face_velocity_by_hydrograph = {}
+    if args.hdf_glob:
+        face_velocity_by_hydrograph = load_face_velocity_by_hydrograph(
+            args.hdf_glob, device
+        )
+    else:
+        face_velocity = load_face_velocity(args.hdf_file, device)
 
     model = MeshGraphKAN(
         args.num_input_features,
@@ -139,6 +188,17 @@ def evaluate_checkpoint(args, checkpoint_name: str, checkpoint_path: Path) -> di
     metric_count = 0
     with torch.no_grad():
         for idx in range(len(dataset)):
+            hydrograph_id = dataset.hydrograph_ids[idx]
+            if face_velocity_by_hydrograph:
+                if hydrograph_id not in face_velocity_by_hydrograph:
+                    available = ", ".join(sorted(face_velocity_by_hydrograph))
+                    raise ValueError(
+                        f"No HEC-RAS HDF loaded for hydrograph {hydrograph_id}. "
+                        f"Available hydrographs: {available}"
+                    )
+                face_velocity_for_hydrograph = face_velocity_by_hydrograph[hydrograph_id]
+            else:
+                face_velocity_for_hydrograph = face_velocity
             graph, rollout_data = dataset[idx]
             graph = graph.to(device)
             x_iter = graph.x.to(device)
@@ -150,7 +210,7 @@ def evaluate_checkpoint(args, checkpoint_name: str, checkpoint_path: Path) -> di
 
             for step in range(args.rollout_length):
                 hdf_step = args.hdf_start_index + step
-                if hdf_step >= face_velocity.shape[0]:
+                if hdf_step >= face_velocity_for_hydrograph.shape[0]:
                     break
 
                 volume_window = x_iter[
@@ -160,7 +220,7 @@ def evaluate_checkpoint(args, checkpoint_name: str, checkpoint_path: Path) -> di
                 pred_delta = pred[:, 1] * volume_std
                 gt_delta = (volume_gt_seq[step] - volume_window[:, -1]) * volume_std
                 proxy = face_delta_proxy(
-                    face_velocity[hdf_step],
+                    face_velocity_for_hydrograph[hdf_step],
                     face_graph,
                     x_iter.shape[0],
                     args.delta_t,
@@ -221,7 +281,11 @@ def main() -> None:
     parser.add_argument("--train-data-dir")
     parser.add_argument("--test-data-dir")
     parser.add_argument("--eval-ids-file", default="test.txt")
-    parser.add_argument("--hdf-file", required=True, type=Path)
+    parser.add_argument("--hdf-file", type=Path)
+    parser.add_argument(
+        "--hdf-glob",
+        help="Event-specific HEC-RAS HDF glob. Event IDs are inferred from planH1/H1/T1 path parts.",
+    )
     parser.add_argument("--face-graph-file", required=True, type=Path)
     parser.add_argument("--prefix", default="M80")
     parser.add_argument("--n-time-steps", type=int, default=2)
@@ -242,6 +306,9 @@ def main() -> None:
     )
     parser.add_argument("--checkpoint", action="append", nargs=2, required=True)
     args = parser.parse_args()
+
+    if (args.hdf_file is None) == (args.hdf_glob is None):
+        parser.error("Provide exactly one of --hdf-file or --hdf-glob.")
 
     if not args.matched_hdf_event:
         print(

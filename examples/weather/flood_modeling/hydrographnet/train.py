@@ -135,6 +135,7 @@ class MGNTrainer:
             ),
             hecras_face_graph_file=cfg.get("hecras_face_graph_file"),
             hecras_face_velocity_file=cfg.get("hecras_face_velocity_file"),
+            hecras_face_velocity_glob=cfg.get("hecras_face_velocity_glob"),
             hecras_face_velocity_path=cfg.get("hecras_face_velocity_path"),
             hecras_face_time_offset=cfg.get("hecras_face_time_offset", 0),
         )

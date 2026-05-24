@@ -71,6 +71,7 @@ use_hecras_face_loss: false
 hecras_face_loss_weight: 0.0
 hecras_face_graph_file: null
 hecras_face_velocity_file: null
+hecras_face_velocity_glob: null
 hecras_face_velocity_path: "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/2D Flow Areas/per2/Face Velocity"
 hecras_face_time_offset: 0
 hecras_face_zone_mode: zone_weight  # zone_weight, high, or all
