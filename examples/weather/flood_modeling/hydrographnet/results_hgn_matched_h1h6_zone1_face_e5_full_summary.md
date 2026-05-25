@@ -13,6 +13,7 @@ Date: 2026-05-24
 - HEC-RAS matched event HDFs: `/mnt/8tb_hdd2/joyce/hecras-dataset/origin/Linux_RAS_v66/Minxiong_hgn_h1h6/outputs_seed/planH*/Minxiong.p01.hdf`
 - Face graph: `/mnt/8tb_hdd2/joyce/Minxiong/hecras_hgn_face_graph_hgn_h1h6_check.npz`
 - Main new checkpoint: `checkpoints_hgn_h1h6_zone1_hecrasface_w1e9_e5_full`
+- Metric field `zone_3` is the zero-based implementation label for the study's Zone 4 high-fidelity region; older headings below retain the original metric label.
 
 ## Compared Checkpoints
 
@@ -54,6 +55,13 @@ Zone-only reached the lowest final training MSE and Zone 3 water-depth training 
 
 Lower is better. The face residual metric evaluates local conservation consistency against matched event-specific HEC-RAS face velocities.
 
+Correction on 2026-05-25: this historical table used autoregressive
+checkpoint-dependent proxy scaling during multi-step rollout. Use
+`results_hgn_matched_h1h6_face_residual_all_e5_full_ablation_fixedscale_summary.md`
+for cross-checkpoint conservation conclusions. Its ground-truth reference fixes
+the HDF proxy scale across checkpoints, and identifies `zone + face` as the
+best fixed-scale face residual model at lengths 10, 30, and 45.
+
 | rollout length | checkpoint | pred face residual RMSE | Zone 3 pred face residual RMSE |
 |---:|---|---:|---:|
 | 10 | zone + face | 174.9773 | 148.9561 |
@@ -68,7 +76,7 @@ Lower is better. The face residual metric evaluates local conservation consisten
 | 45 | face-only | 173.5640 | 162.2554 |
 | 45 | noface | 210.9691 | 228.3314 |
 
-Interpretation: HEC-RAS face loss clearly improves local conservation. Zone-only has the weakest face residual among the four-checkpoint ablation, which confirms that zone supervision alone does not enforce HEC-RAS-style face conservation. The pure face-loss model remains best on the face residual metric, while zone + face keeps much of the conservation gain and improves rollout prediction quality.
+Historical interpretation (superseded for cross-checkpoint comparison): under the autoregressive scaling table, the pure face-loss model appeared best. The corrected fixed-scale evaluation shows that `zone + face` has the lowest global and high-fidelity face residual at lengths 10, 30, and 45, while confirming that zone supervision alone does not enforce HEC-RAS-style face conservation.
 
 ## Rollout Evaluation
 
@@ -97,9 +105,9 @@ The best current configuration for volume-aware rollout accuracy is:
 
 `zone_loss_weight=1.0 + hecras_face_loss_weight=1e-9 + matched event-specific HDF face velocities`
 
-The best current configuration for the HEC-RAS face residual metric alone is:
+The best current configuration for the corrected fixed-scale HEC-RAS face residual metric is:
 
-`zone_loss_weight=0.0 + hecras_face_loss_weight=1e-9`
+`zone_loss_weight=1.0 + hecras_face_loss_weight=1e-9 + matched event-specific HDF face velocities`
 
 This supports keeping the losses separated in the code and reporting them as different objectives: zone loss improves multi-resolution rollout accuracy, face loss improves local conservation, and the combined model is currently the best candidate when water volume and physics consistency matter.
 

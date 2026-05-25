@@ -12,7 +12,9 @@ loss. It is intentionally separate from:
 
 The HEC-RAS HDF face velocity is event-specific. Use this diagnostic only when
 the HDF event is known to correspond to the selected HydroGraphNet hydrograph,
-or treat the result strictly as an alignment/scale diagnostic.
+or treat the result strictly as an alignment/scale diagnostic. By default the
+face proxy is calibrated against ground-truth volume transitions, so its scale
+is independent of the checkpoint being compared.
 """
 
 import argparse
@@ -207,6 +209,9 @@ def evaluate_checkpoint(args, checkpoint_name: str, checkpoint_path: Path) -> di
             volume_gt_seq = rollout_data["volume_gt"].to(device)
             inflow_seq = rollout_data["inflow"].to(device)
             precip_seq = rollout_data["precipitation"].to(device)
+            initial_volume = x_iter[
+                :, 12 + args.n_time_steps : 12 + 2 * args.n_time_steps
+            ][:, -1].clone()
 
             for step in range(args.rollout_length):
                 hdf_step = args.hdf_start_index + step
@@ -218,21 +223,38 @@ def evaluate_checkpoint(args, checkpoint_name: str, checkpoint_path: Path) -> di
                 ]
                 pred = model(x_iter, edge_features, graph)
                 pred_delta = pred[:, 1] * volume_std
-                gt_delta = (volume_gt_seq[step] - volume_window[:, -1]) * volume_std
+                autoregressive_gt_delta = (
+                    volume_gt_seq[step] - volume_window[:, -1]
+                ) * volume_std
+                gt_previous_volume = (
+                    initial_volume if step == 0 else volume_gt_seq[step - 1]
+                )
+                ground_truth_delta = (
+                    volume_gt_seq[step] - gt_previous_volume
+                ) * volume_std
+                proxy_target_delta = (
+                    ground_truth_delta
+                    if args.proxy_scale_reference == "ground_truth"
+                    else autoregressive_gt_delta
+                )
                 proxy = face_delta_proxy(
                     face_velocity_for_hydrograph[hdf_step],
                     face_graph,
                     x_iter.shape[0],
                     args.delta_t,
                 )
-                scale = scale_proxy_to_target(proxy, gt_delta)
+                scale = scale_proxy_to_target(proxy, proxy_target_delta)
                 proxy_scaled = proxy * scale
 
                 pred_residual = pred_delta - proxy_scaled
-                gt_residual = gt_delta - proxy_scaled
+                gt_residual = proxy_target_delta - proxy_scaled
                 add_metric(metric_sums, "pred_face_residual_rmse", rmse(pred_residual))
                 add_metric(metric_sums, "gt_face_residual_rmse", rmse(gt_residual))
-                add_metric(metric_sums, "pred_vs_gt_delta_rmse", rmse(pred_delta - gt_delta))
+                add_metric(
+                    metric_sums,
+                    "pred_vs_gt_delta_rmse",
+                    rmse(pred_delta - proxy_target_delta),
+                )
                 add_metric(metric_sums, "face_proxy_scale", scale)
 
                 for zone in range(4):
@@ -251,7 +273,7 @@ def evaluate_checkpoint(args, checkpoint_name: str, checkpoint_path: Path) -> di
                         add_metric(
                             metric_sums,
                             f"zone_{zone}_pred_vs_gt_delta_rmse",
-                            rmse(pred_delta[mask] - gt_delta[mask]),
+                            rmse(pred_delta[mask] - proxy_target_delta[mask]),
                         )
 
                 x_iter = update_rollout_state(
@@ -269,6 +291,7 @@ def evaluate_checkpoint(args, checkpoint_name: str, checkpoint_path: Path) -> di
         "rollout_length": args.rollout_length,
         "hdf_start_index": args.hdf_start_index,
         "matched_hdf_event": args.matched_hdf_event,
+        "proxy_scale_reference": args.proxy_scale_reference,
     }
     for key in sorted(metric_sums):
         row[key] = metric_sums[key] / max(metric_count, 1)
@@ -292,6 +315,16 @@ def main() -> None:
     parser.add_argument("--rollout-length", type=int, default=10)
     parser.add_argument("--hdf-start-index", type=int, default=0)
     parser.add_argument("--delta-t", type=float, default=1200.0)
+    parser.add_argument(
+        "--proxy-scale-reference",
+        choices=("ground_truth", "autoregressive"),
+        default="ground_truth",
+        help=(
+            "Transition used to calibrate the HEC-RAS face proxy. ground_truth "
+            "uses observed previous volumes and gives checkpoint-independent "
+            "scales; autoregressive reproduces the legacy rollout diagnostic."
+        ),
+    )
     parser.add_argument("--zone-label-file", default="zone_label.txt")
     parser.add_argument("--zone-weight-file", default="zone_weight.txt")
     parser.add_argument("--num-input-features", type=int, default=16)
