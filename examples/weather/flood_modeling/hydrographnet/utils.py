@@ -202,12 +202,14 @@ def compute_hecras_face_local_loss(
     zone_mode="zone_weight",
     calibrate_to_target=True,
 ):
-    """Compute selective local loss on HEC-RAS true internal faces.
+    """Compute a selective calibrated face-velocity proxy loss.
 
     This branch is intentionally separate from the kNN/VX/VY proxy loss. It uses
     HEC-RAS internal face connectivity, face length, and optional HDF face
-    velocity. The HDF velocity is event-specific, so keep this loss disabled
-    unless the event mapping has been reviewed.
+    velocity. Because ``velocity * face_length`` is not a volume transfer,
+    this remains a prototype objective rather than formal local conservation.
+    Keep it disabled for formal claims until the uncalibrated physical budget
+    validator passes on synchronized event HDF and HGN targets.
     """
     required_attrs = (
         "hecras_face_index",

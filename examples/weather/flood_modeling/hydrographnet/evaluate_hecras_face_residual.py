@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Evaluate HEC-RAS true-face local residuals by fidelity zone.
+"""Evaluate a calibrated HEC-RAS face-velocity proxy residual by fidelity zone.
 
 This script is a diagnostic bridge toward a future face-based local conservation
 loss. It is intentionally separate from:
@@ -10,11 +10,11 @@ loss. It is intentionally separate from:
 - kNN + VX/VY pseudo-local residuals
 - model training
 
-The HEC-RAS HDF face velocity is event-specific. Use this diagnostic only when
-the HDF event is known to correspond to the selected HydroGraphNet hydrograph,
-or treat the result strictly as an alignment/scale diagnostic. By default the
-face proxy is calibrated against ground-truth volume transitions, so its scale
-is independent of the checkpoint being compared.
+This is a prototype/ablation diagnostic, not formal local conservation. The
+face proxy uses ``velocity * face_length`` and can be calibrated against target
+volume transitions; it does not reconstruct a dimensionally complete HEC-RAS
+cell-volume budget. Formal evidence must first pass
+``evaluate_hecras_physical_budget.py`` without fitted scale calibration.
 """
 
 import argparse
