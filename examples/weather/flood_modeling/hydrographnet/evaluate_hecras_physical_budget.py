@@ -809,7 +809,7 @@ def main() -> None:
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = list(rows[0].keys())
     with args.output_csv.open("w", newline="") as output_file:
-        writer = csv.DictWriter(output_file, fieldnames=fieldnames)
+        writer = csv.DictWriter(output_file, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     if args.output_md is not None:
