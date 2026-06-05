@@ -86,6 +86,20 @@ hecras_face_geometry_zone_mode: zone_weight  # zone_weight, high/high_adjacent, 
 hecras_face_geometry_wet_depth_threshold: null  # physical water depth threshold; null disables wet/dry masking
 hecras_face_geometry_reference_mode: smooth  # smooth, target_gradient, source_smooth, or source_target_gradient
 
+# Formal HEC-RAS cell-balance branch. This uses native Cell Flow Balance
+# integrated over the matching HGN interval plus native precipitation volume.
+# It is separate from the calibrated face-velocity proxy and should be used
+# only with synchronized event HDFs and area-extrapolated HGN volume targets.
+use_hecras_cell_balance_loss: false
+hecras_cell_balance_loss_weight: 0.0
+hecras_cell_balance_zone_mode: zone_weight  # zone_weight, high, or all
+hecras_cell_balance_glob: null
+hecras_cell_balance_path: "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/2D Flow Areas/per2/Cell Flow Balance"
+hecras_precipitation_path: "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/2D Flow Areas/per2/Cell Cumulative Precipitation Depth"
+hecras_result_time_path: "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Time"
+hecras_cell_xy_path: "Geometry/2D Flow Areas/per2/Cells Center Coordinate"
+hecras_cell_surface_area_path: "Geometry/2D Flow Areas/per2/Cells Surface Area"
+
 # Performance and optimization configurations.
 use_apex: True            # Use NVIDIA Apex for mixed precision if available.
 amp: False                # Automatic mixed precision flag.

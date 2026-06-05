@@ -325,6 +325,25 @@ class HydroGraphDataset(Dataset):
             "2D Flow Areas/per2/Face Velocity"
         ),
         hecras_face_time_offset: int = 0,
+        return_hecras_cell_balance: bool = False,
+        hecras_cell_balance_glob: Optional[str] = None,
+        hecras_cell_balance_path: str = (
+            "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/"
+            "2D Flow Areas/per2/Cell Flow Balance"
+        ),
+        hecras_precipitation_path: str = (
+            "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/"
+            "2D Flow Areas/per2/Cell Cumulative Precipitation Depth"
+        ),
+        hecras_result_time_path: str = (
+            "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Time"
+        ),
+        hecras_cell_xy_path: str = (
+            "Geometry/2D Flow Areas/per2/Cells Center Coordinate"
+        ),
+        hecras_cell_surface_area_path: str = (
+            "Geometry/2D Flow Areas/per2/Cells Surface Area"
+        ),
         norm_stats_dir: Optional[Union[str, Path]] = None,
     ):
         if split not in {"train", "test"}:
@@ -360,6 +379,13 @@ class HydroGraphDataset(Dataset):
         self.hecras_face_velocity_glob = hecras_face_velocity_glob
         self.hecras_face_velocity_path = hecras_face_velocity_path
         self.hecras_face_time_offset = hecras_face_time_offset
+        self.return_hecras_cell_balance = return_hecras_cell_balance
+        self.hecras_cell_balance_glob = hecras_cell_balance_glob
+        self.hecras_cell_balance_path = hecras_cell_balance_path
+        self.hecras_precipitation_path = hecras_precipitation_path
+        self.hecras_result_time_path = hecras_result_time_path
+        self.hecras_cell_xy_path = hecras_cell_xy_path
+        self.hecras_cell_surface_area_path = hecras_cell_surface_area_path
         self.norm_stats_dir = str(norm_stats_dir) if norm_stats_dir is not None else None
 
         # Placeholders for static and dynamic data, indices, and normalization stats.
@@ -375,6 +401,7 @@ class HydroGraphDataset(Dataset):
         self.hecras_face_graph = None
         self.hecras_face_velocity = None
         self.hecras_face_velocity_by_hydrograph = {}
+        self.hecras_cell_balance_delta_by_hydrograph = {}
 
         self.process()
 
@@ -569,6 +596,11 @@ class HydroGraphDataset(Dataset):
             }
             self.dynamic_data.append(dyn_std)
 
+        if self.return_hecras_cell_balance:
+            self.hecras_cell_balance_delta_by_hydrograph = (
+                self.load_hecras_cell_balance_delta_by_hydrograph()
+            )
+
         # Build sample indices for training (sliding window) or validate test data.
         if self.split == "train":
             for h_idx, dyn in enumerate(self.dynamic_data):
@@ -680,6 +712,10 @@ class HydroGraphDataset(Dataset):
                     dtype=torch.float,
                 )
                 self.add_hecras_face_attrs(g, t_idx, self.hydrograph_ids[hydro_idx])
+            if self.return_hecras_cell_balance:
+                self.add_hecras_cell_balance_attrs(
+                    g, prev_time, self.hydrograph_ids[hydro_idx]
+                )
 
             # Determine if physics data should be returned.
             need_physics = self.return_physics or (self.noise_type == "pushforward")
@@ -833,6 +869,10 @@ class HydroGraphDataset(Dataset):
                     dtype=torch.float,
                 )
                 self.add_hecras_face_attrs(g, 0, self.hydrograph_ids[idx])
+            if self.return_hecras_cell_balance:
+                self.add_hecras_cell_balance_attrs(
+                    g, self.n_time_steps - 1, self.hydrograph_ids[idx]
+                )
             rollout_data = {
                 "inflow": torch.tensor(
                     dyn["inflow_hydrograph"][
@@ -885,6 +925,197 @@ class HydroGraphDataset(Dataset):
                 f"Expected {num_nodes} zone weights, found {zone_weight.shape[0]}"
             )
         return zone_label, zone_weight
+
+    def infer_hecras_hydrograph_id(self, hdf_path: Path) -> str:
+        """Infer an H1/T1 hydrograph ID from an event-specific HEC-RAS HDF path."""
+        for part in reversed(hdf_path.parts):
+            match = re.fullmatch(r"plan([HT]\d+)", part, flags=re.IGNORECASE)
+            if match is not None:
+                return match.group(1).upper()
+        for part in reversed(hdf_path.parts):
+            match = re.fullmatch(r"([HT]\d+)", part, flags=re.IGNORECASE)
+            if match is not None:
+                return match.group(1).upper()
+        raise ValueError(
+            "Could not infer hydrograph ID from HDF path. Expected a path "
+            f"containing planH1/H1/T1, got: {hdf_path}"
+        )
+
+    def load_hecras_event_hdf_paths(self, hdf_glob: str) -> dict[str, Path]:
+        """Load event-specific HEC-RAS HDF paths keyed by hydrograph ID."""
+        if hdf_glob.startswith("/"):
+            matched_files = sorted(Path("/").glob(hdf_glob[1:]))
+        else:
+            matched_files = sorted(Path().glob(hdf_glob))
+        if not matched_files:
+            raise FileNotFoundError(f"No HEC-RAS HDFs matched: {hdf_glob}")
+
+        paths_by_hydrograph = {}
+        for hdf_path in matched_files:
+            hydrograph_id = self.infer_hecras_hydrograph_id(hdf_path)
+            if hydrograph_id in paths_by_hydrograph:
+                raise ValueError(
+                    f"Multiple HEC-RAS HDF files map to hydrograph {hydrograph_id}."
+                )
+            paths_by_hydrograph[hydrograph_id] = hdf_path
+        return paths_by_hydrograph
+
+    def load_hgn_event_time_days(
+        self,
+        hydrograph_id: str,
+        interval: int = 1,
+        skip: int = 72,
+    ) -> np.ndarray:
+        """Load the HGN event time axis after the dataset's skip and peak trim."""
+        inflow_path = os.path.join(
+            self.data_dir, f"{self.prefix}_US_InF_{hydrograph_id}.txt"
+        )
+        inflow = np.loadtxt(inflow_path, delimiter="\t")
+        time_days = np.asarray(inflow[skip::interval, 0], dtype=np.float64)
+        inflow_hydrograph = np.asarray(inflow[skip::interval, 1], dtype=np.float64)
+        peak_time_idx = int(np.argmax(inflow_hydrograph))
+        return time_days[: peak_time_idx + 25]
+
+    @staticmethod
+    def match_hgn_times_to_hdf(
+        hgn_time_days: np.ndarray, hdf_time_days: np.ndarray
+    ) -> np.ndarray:
+        """Return HDF output indices corresponding to each HGN target time."""
+        matched = np.searchsorted(hdf_time_days, hgn_time_days)
+        matched = np.clip(matched, 0, hdf_time_days.shape[0] - 1)
+        previous = np.maximum(matched - 1, 0)
+        choose_previous = (
+            np.abs(hdf_time_days[previous] - hgn_time_days)
+            < np.abs(hdf_time_days[matched] - hgn_time_days)
+        )
+        matched[choose_previous] = previous[choose_previous]
+        differences_seconds = np.abs(hdf_time_days[matched] - hgn_time_days) * 86400.0
+        if np.max(differences_seconds) > 1e-3:
+            raise ValueError(
+                "HGN target times are not represented in the HDF output series; "
+                f"max mismatch is {np.max(differences_seconds)} seconds."
+            )
+        return matched
+
+    def map_hgn_nodes_to_hdf_cells(self, hdf_xy: np.ndarray) -> np.ndarray:
+        """Map active HGN node order back to original HDF cell indices by XY."""
+        if self.static_data_raw_xy is None:
+            raise ValueError("HGN raw XY coordinates are not loaded.")
+        distances, original_indices = scipy_spatial.KDTree(hdf_xy).query(
+            self.static_data_raw_xy, k=1
+        )
+        if (
+            np.max(distances) > 1e-6
+            or np.unique(original_indices).size != self.static_data_raw_xy.shape[0]
+        ):
+            raise ValueError(
+                "HGN-to-HDF coordinate mapping is not unique or exceeds tolerance."
+            )
+        return original_indices.astype(np.int64)
+
+    def load_hecras_cell_balance_delta_by_hydrograph(self) -> dict[str, np.ndarray]:
+        """Precompute formal HEC-RAS cell budget deltas aligned to HGN intervals.
+
+        The target is native ``Cell Flow Balance`` integrated over each HGN
+        interval plus native cumulative precipitation depth converted to cell
+        volume. Values are denormalized ft^3 and are intentionally separate
+        from the older face-velocity proxy loss.
+        """
+        try:
+            import h5py
+        except ImportError as exc:
+            raise ImportError(
+                "h5py is required when return_hecras_cell_balance=True."
+            ) from exc
+
+        if self.hecras_cell_balance_glob is None:
+            raise ValueError(
+                "return_hecras_cell_balance=True requires hecras_cell_balance_glob."
+            )
+        hdf_paths = self.load_hecras_event_hdf_paths(self.hecras_cell_balance_glob)
+        balance_by_hydrograph = {}
+        for dyn in self.dynamic_data:
+            hydrograph_id = dyn["hydro_id"]
+            hdf_path = hdf_paths.get(hydrograph_id)
+            if hdf_path is None:
+                available = ", ".join(sorted(hdf_paths))
+                raise KeyError(
+                    f"No HEC-RAS cell-balance HDF loaded for {hydrograph_id}. "
+                    f"Available hydrographs: {available}"
+                )
+
+            hgn_time_days = self.load_hgn_event_time_days(hydrograph_id)
+            if hgn_time_days.shape[0] != dyn["volume"].shape[0]:
+                raise ValueError(
+                    f"HGN time count mismatch for {hydrograph_id}: "
+                    f"{hgn_time_days.shape[0]} times vs {dyn['volume'].shape[0]} volumes."
+                )
+
+            with h5py.File(hdf_path, "r") as hdf:
+                for required_path in (
+                    self.hecras_cell_balance_path,
+                    self.hecras_precipitation_path,
+                    self.hecras_result_time_path,
+                    self.hecras_cell_xy_path,
+                    self.hecras_cell_surface_area_path,
+                ):
+                    if required_path not in hdf:
+                        raise KeyError(
+                            f"Required HEC-RAS HDF path not found in {hdf_path}: "
+                            f"{required_path}"
+                        )
+                hdf_time_days = np.asarray(
+                    hdf[self.hecras_result_time_path], dtype=np.float64
+                )
+                target_time_indices = self.match_hgn_times_to_hdf(
+                    hgn_time_days, hdf_time_days
+                )
+                original_indices = self.map_hgn_nodes_to_hdf_cells(
+                    np.asarray(hdf[self.hecras_cell_xy_path], dtype=np.float64)
+                )
+                cell_surface_area = np.asarray(
+                    hdf[self.hecras_cell_surface_area_path], dtype=np.float64
+                )[original_indices]
+                hdf_time_seconds = hdf_time_days * 86400.0
+                balance_dataset = hdf[self.hecras_cell_balance_path]
+                precip_dataset = hdf[self.hecras_precipitation_path]
+                deltas = np.zeros(
+                    (target_time_indices.shape[0] - 1, original_indices.size),
+                    dtype=np.float64,
+                )
+                for transition_index, (start, end) in enumerate(
+                    zip(target_time_indices[:-1], target_time_indices[1:])
+                ):
+                    if end <= start:
+                        raise ValueError(
+                            "Target times must map to increasing HDF output indices."
+                        )
+                    balance_window = np.nan_to_num(
+                        np.asarray(balance_dataset[start : end + 1, :], dtype=np.float64)[
+                            :, original_indices
+                        ],
+                        nan=0.0,
+                    )
+                    balance_delta = np.trapz(
+                        balance_window,
+                        x=hdf_time_seconds[start : end + 1],
+                        axis=0,
+                    )
+                    precip_delta = (
+                        (
+                            np.asarray(precip_dataset[end, :], dtype=np.float64)[
+                                original_indices
+                            ]
+                            - np.asarray(precip_dataset[start, :], dtype=np.float64)[
+                                original_indices
+                            ]
+                        )
+                        / 12.0
+                        * cell_surface_area
+                    )
+                    deltas[transition_index] = balance_delta + precip_delta
+            balance_by_hydrograph[hydrograph_id] = deltas.astype(np.float32)
+        return balance_by_hydrograph
 
     def load_hecras_face_graph(self, num_nodes: int) -> dict[str, np.ndarray]:
         """Load HEC-RAS internal face connectivity aligned to HGN node order."""
@@ -1024,6 +1255,31 @@ class HydroGraphDataset(Dataset):
                 ],
                 dtype=torch.float,
             )
+
+    def add_hecras_cell_balance_attrs(
+        self, graph, transition_index: int, hydrograph_id: str
+    ) -> None:
+        """Attach the formal HEC-RAS cell budget delta for one HGN interval."""
+        cell_balance_delta = self.hecras_cell_balance_delta_by_hydrograph.get(
+            hydrograph_id
+        )
+        if cell_balance_delta is None:
+            available = ", ".join(sorted(self.hecras_cell_balance_delta_by_hydrograph))
+            raise KeyError(
+                f"No HEC-RAS cell-balance target loaded for {hydrograph_id}. "
+                f"Available hydrographs: {available}"
+            )
+        if transition_index < 0 or transition_index >= cell_balance_delta.shape[0]:
+            raise IndexError(
+                f"HEC-RAS cell-balance transition index {transition_index} is outside "
+                f"0..{cell_balance_delta.shape[0] - 1} for {hydrograph_id}."
+            )
+        graph.hecras_cell_balance_delta = torch.tensor(
+            cell_balance_delta[transition_index], dtype=torch.float
+        )
+        graph.volume_std = torch.tensor(
+            [self.dynamic_stats["volume"]["std"]], dtype=torch.float
+        )
 
     def compute_local_source_rate(
         self, dyn: dict[str, np.ndarray], prev_time: int, target_time: int

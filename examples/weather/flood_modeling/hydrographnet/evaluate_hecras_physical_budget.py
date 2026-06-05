@@ -40,6 +40,7 @@ TARGET_VOLUME_SOURCES = ("hgn_target", "hdf_reconstructed")
 BOUNDARY_MODES = ("reconstructed_all_touching_faces", "native_bc_only")
 RECONSTRUCTED_FLUX_SOURCE = "reconstructed_velocity_area"
 NATIVE_FLUX_SOURCE = "native_face_flow"
+NATIVE_CELL_BALANCE_SOURCE = "native_cell_flow_balance"
 
 
 def infer_hydrograph_id_from_path(path: Path) -> str:
@@ -143,18 +144,33 @@ def reconstruct_cell_volume(
     original_indices: np.ndarray,
     volume_info: np.ndarray,
     volume_values: np.ndarray,
+    cell_surface_area: np.ndarray | None = None,
+    volume_extrapolation: str = "cap",
 ) -> np.ndarray:
     reconstructed = np.zeros((water_surface.shape[0], original_indices.size))
     for hgn_index, original_index in enumerate(original_indices):
         offset, count = volume_info[original_index]
+        if count <= 0:
+            continue
         curve = volume_values[offset : offset + count]
-        reconstructed[:, hgn_index] = np.interp(
+        capped_volume = np.interp(
             water_surface[:, original_index],
             curve[:, 0],
             curve[:, 1],
             left=0.0,
             right=curve[-1, 1],
         )
+        if volume_extrapolation == "area_above_table":
+            if cell_surface_area is None:
+                raise ValueError(
+                    "cell_surface_area is required for area_above_table extrapolation."
+                )
+            capped_volume = capped_volume + np.maximum(
+                water_surface[:, original_index] - curve[-1, 0], 0.0
+            ) * cell_surface_area[hgn_index]
+        elif volume_extrapolation != "cap":
+            raise ValueError(f"Unsupported volume extrapolation: {volume_extrapolation}")
+        reconstructed[:, hgn_index] = capped_volume
     return reconstructed
 
 
@@ -363,6 +379,42 @@ def integrate_transport_from_hdf(
     return transport_delta
 
 
+def integrate_cell_balance_from_hdf(
+    hdf_path: Path,
+    original_indices: np.ndarray,
+    hdf_time_days: np.ndarray,
+    target_time_indices: np.ndarray,
+    sign_mode: str,
+) -> np.ndarray:
+    """Integrate native HEC-RAS cell flow balance over HGN intervals."""
+    sign = 1.0 if sign_mode == "cell_order" else -1.0
+    hdf_time_seconds = hdf_time_days * 86400.0
+    balance_path = RESULT_BASE + "Cell Flow Balance"
+    balance_delta = np.zeros(
+        (target_time_indices.shape[0] - 1, original_indices.size), dtype=np.float64
+    )
+    with h5py.File(hdf_path, "r") as hdf:
+        balance_dataset = hdf[balance_path]
+        for transition_index, (start, end) in enumerate(
+            zip(target_time_indices[:-1], target_time_indices[1:])
+        ):
+            if end <= start:
+                raise ValueError("Target times must map to increasing HDF output indices.")
+            cell_balance = sign * np.nan_to_num(
+                np.asarray(
+                    balance_dataset[start : end + 1, original_indices],
+                    dtype=np.float64,
+                ),
+                nan=0.0,
+            )
+            balance_delta[transition_index] = np.trapezoid(
+                cell_balance,
+                x=hdf_time_seconds[start : end + 1],
+                axis=0,
+            )
+    return balance_delta
+
+
 def metric_dict(target: np.ndarray, budget: np.ndarray) -> dict[str, float]:
     residual = target - budget
     target_flat = target.reshape(-1)
@@ -396,6 +448,7 @@ def evaluate_event(
     end_index: int | None,
     storage_alignment_atol: float,
     target_volume_sources: tuple[str, ...],
+    volume_extrapolation: str,
 ) -> list[dict]:
     volume = np.loadtxt(data_dir / f"{prefix}_V_{event_id}.txt")
     hgn_xy = np.loadtxt(data_dir / f"{prefix}_XY.txt")
@@ -453,7 +506,12 @@ def evaluate_event(
             dtype=np.float64,
         )
     hdf_volume_all = reconstruct_cell_volume(
-        water_surface, original_indices, volume_info, volume_values
+        water_surface,
+        original_indices,
+        volume_info,
+        volume_values,
+        cell_surface_area=cell_surface_area,
+        volume_extrapolation=volume_extrapolation,
     )
     hdf_volume = hdf_volume_all
     storage_difference = hdf_volume - volume
@@ -480,25 +538,40 @@ def evaluate_event(
     flux_sources = [RECONSTRUCTED_FLUX_SOURCE]
     if has_native_face_flow:
         flux_sources.append(NATIVE_FLUX_SOURCE)
+    if has_native_cell_flow_balance:
+        flux_sources.append(NATIVE_CELL_BALANCE_SOURCE)
     for flux_source in flux_sources:
-        stage_rules = FACE_STAGE_RULES if flux_source == RECONSTRUCTED_FLUX_SOURCE else ("native",)
+        stage_rules = (
+            FACE_STAGE_RULES if flux_source == RECONSTRUCTED_FLUX_SOURCE else ("native",)
+        )
         for stage_rule in stage_rules:
             for sign_mode in SIGN_MODES:
                 for boundary_mode in BOUNDARY_MODES:
-                    transport_delta = integrate_transport_from_hdf(
-                        hdf_path,
-                        face_cells,
-                        mapped_face_cells,
-                        num_nodes,
-                        hdf_time_days,
-                        target_time_indices[first_transition - 1 :],
-                        area_info,
-                        area_values,
-                        stage_rule,
-                        sign_mode,
-                        boundary_mode,
-                        flux_source,
-                    )
+                    if flux_source == NATIVE_CELL_BALANCE_SOURCE:
+                        if boundary_mode != "reconstructed_all_touching_faces":
+                            continue
+                        transport_delta = integrate_cell_balance_from_hdf(
+                            hdf_path,
+                            original_indices,
+                            hdf_time_days,
+                            target_time_indices[first_transition - 1 :],
+                            sign_mode,
+                        )
+                    else:
+                        transport_delta = integrate_transport_from_hdf(
+                            hdf_path,
+                            face_cells,
+                            mapped_face_cells,
+                            num_nodes,
+                            hdf_time_days,
+                            target_time_indices[first_transition - 1 :],
+                            area_info,
+                            area_values,
+                            stage_rule,
+                            sign_mode,
+                            boundary_mode,
+                            flux_source,
+                        )
                     for source_mode in SOURCE_MODES:
                         budget = transport_delta.copy()
                         if source_mode == "hdf_precipitation":
@@ -629,6 +702,7 @@ def write_markdown_summary(
     data_dir: Path,
     ids_file: str,
     hdf_glob: str,
+    residual_relative_rmse_threshold: float,
 ) -> None:
     aggregate = [
         row for row in rows if row["event_id"] == "MEAN" and row["scope"] == "all"
@@ -645,13 +719,20 @@ def write_markdown_summary(
         ],
         key=lambda row: row["relative_rmse"],
     )
+    core_gates_pass = (
+        hgn_best["storage_aligned"]
+        and hgn_best["has_native_face_flow"]
+        and hgn_best["hdf_output_matches_computation"]
+    )
+    residual_gate_pass = (
+        hgn_best["relative_rmse"] <= residual_relative_rmse_threshold
+        and hdf_best["relative_rmse"] <= residual_relative_rmse_threshold
+    )
     status = (
         "BLOCKED"
-        if (
-            not hgn_best["storage_aligned"]
-            or not hgn_best["has_native_face_flow"]
-            or not hgn_best["hdf_output_matches_computation"]
-        )
+        if not core_gates_pass
+        else "CANDIDATE"
+        if residual_gate_pass
         else "REQUIRES RESIDUAL REVIEW"
     )
     lines = [
@@ -699,12 +780,16 @@ def write_markdown_summary(
             "Budget is evaluated directly in native volume units |"
         ),
         (
-            "| Uncalibrated residual is acceptable for a training target | FAIL | "
-            f"Best HGN-target relative RMSE `{hgn_best['relative_rmse']:.6f}` |"
+            "| Uncalibrated residual is acceptable for a training target | "
+            f"{'PASS' if hgn_best['relative_rmse'] <= residual_relative_rmse_threshold else 'FAIL'} | "
+            f"Best HGN-target relative RMSE `{hgn_best['relative_rmse']:.6f}` "
+            f"(threshold `{residual_relative_rmse_threshold:.6f}`) |"
         ),
         (
-            "| HDF self-storage can be closed by reconstructed face transport | FAIL | "
-            f"Best HDF-self relative RMSE `{hdf_best['relative_rmse']:.6f}` |"
+            "| HDF self-storage can be closed by reconstructed face transport | "
+            f"{'PASS' if hdf_best['relative_rmse'] <= residual_relative_rmse_threshold else 'FAIL'} | "
+            f"Best HDF-self relative RMSE `{hdf_best['relative_rmse']:.6f}` "
+            f"(threshold `{residual_relative_rmse_threshold:.6f}`) |"
         ),
         "",
         "## Best Uncalibrated Variants",
@@ -731,8 +816,18 @@ def write_markdown_summary(
         "## Interpretation",
         "",
         "- The result is uncalibrated: no regression scale factor is fitted to target volume changes.",
-        "- Current HDF forcing matching is insufficient because its reconstructed dynamic storage does not reproduce the HGN target storage.",
-        "- HEC-RAS documentation identifies optional `Face flow` and `Cell flow balance` HDF variables; they are not present in the evaluated HDF and should be enabled for formal budget evidence.",
+        (
+            "- HDF reconstructed dynamic storage reproduces the HGN `M80_V` target, "
+            "so the event/HGN target pair is synchronized at the storage level."
+            if hgn_best["storage_aligned"]
+            else "- Current HDF forcing matching is insufficient because its reconstructed dynamic storage does not reproduce the HGN target storage."
+        ),
+        (
+            "- Native HEC-RAS `Face Flow` and `Cell Flow Balance` are present in this HDF."
+            if hgn_best["has_native_face_flow"]
+            and hgn_best["has_native_cell_flow_balance"]
+            else "- Native HEC-RAS `Face Flow` / `Cell Flow Balance` are not both present in this HDF and should be enabled for formal budget evidence."
+        ),
         (
             "- Temporal sampling check: the HDF stores face samples every "
             f"`{hgn_best['hdf_output_delta_t_seconds']:.6f} s`, while the "
@@ -780,6 +875,21 @@ def main() -> None:
         choices=TARGET_VOLUME_SOURCES,
         help="Volume transition target to evaluate. Defaults to both sources.",
     )
+    parser.add_argument(
+        "--volume-extrapolation",
+        choices=("cap", "area_above_table"),
+        default="cap",
+        help=(
+            "How to reconstruct HDF cell storage above finite HEC-RAS "
+            "volume-elevation table tops."
+        ),
+    )
+    parser.add_argument(
+        "--residual-relative-rmse-threshold",
+        type=float,
+        default=0.1,
+        help="Relative RMSE threshold used for the Markdown residual gate.",
+    )
     parser.add_argument("--output-csv", type=Path, required=True)
     parser.add_argument("--output-md", type=Path)
     args = parser.parse_args()
@@ -803,6 +913,7 @@ def main() -> None:
                 args.end_index,
                 args.storage_alignment_atol,
                 target_volume_sources,
+                args.volume_extrapolation,
             )
         )
     rows.extend(add_aggregate_rows(rows))
@@ -814,7 +925,12 @@ def main() -> None:
         writer.writerows(rows)
     if args.output_md is not None:
         write_markdown_summary(
-            args.output_md, rows, args.data_dir, args.ids_file, args.hdf_glob
+            args.output_md,
+            rows,
+            args.data_dir,
+            args.ids_file,
+            args.hdf_glob,
+            args.residual_relative_rmse_threshold,
         )
     aggregate = [
         row for row in rows if row["event_id"] == "MEAN" and row["scope"] == "all"

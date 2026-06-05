@@ -41,6 +41,7 @@ from physicsnemo.utils import load_checkpoint, save_checkpoint
 from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
 from utils import (
     compute_edge_local_proxy_loss,
+    compute_hecras_cell_balance_loss,
     compute_hecras_face_geometry_loss,
     compute_hecras_face_local_loss,
     compute_physics_loss,
@@ -103,6 +104,15 @@ class MGNTrainer:
         self.hecras_face_geometry_reference_mode = cfg.get(
             "hecras_face_geometry_reference_mode", "smooth"
         )
+        self.use_hecras_cell_balance_loss = cfg.get(
+            "use_hecras_cell_balance_loss", False
+        )
+        self.hecras_cell_balance_loss_weight = cfg.get(
+            "hecras_cell_balance_loss_weight", 0.0
+        )
+        self.hecras_cell_balance_zone_mode = cfg.get(
+            "hecras_cell_balance_zone_mode", "zone_weight"
+        )
 
         # Set activation function.
         mlp_act = "relu"
@@ -136,8 +146,46 @@ class MGNTrainer:
             hecras_face_graph_file=cfg.get("hecras_face_graph_file"),
             hecras_face_velocity_file=cfg.get("hecras_face_velocity_file"),
             hecras_face_velocity_glob=cfg.get("hecras_face_velocity_glob"),
-            hecras_face_velocity_path=cfg.get("hecras_face_velocity_path"),
+            hecras_face_velocity_path=cfg.get(
+                "hecras_face_velocity_path",
+                (
+                    "Results/Unsteady/Output/Output Blocks/Base Output/"
+                    "Unsteady Time Series/2D Flow Areas/per2/Face Velocity"
+                ),
+            ),
             hecras_face_time_offset=cfg.get("hecras_face_time_offset", 0),
+            return_hecras_cell_balance=self.use_hecras_cell_balance_loss,
+            hecras_cell_balance_glob=cfg.get("hecras_cell_balance_glob"),
+            hecras_cell_balance_path=cfg.get(
+                "hecras_cell_balance_path",
+                (
+                    "Results/Unsteady/Output/Output Blocks/Base Output/"
+                    "Unsteady Time Series/2D Flow Areas/per2/Cell Flow Balance"
+                ),
+            ),
+            hecras_precipitation_path=cfg.get(
+                "hecras_precipitation_path",
+                (
+                    "Results/Unsteady/Output/Output Blocks/Base Output/"
+                    "Unsteady Time Series/2D Flow Areas/per2/"
+                    "Cell Cumulative Precipitation Depth"
+                ),
+            ),
+            hecras_result_time_path=cfg.get(
+                "hecras_result_time_path",
+                (
+                    "Results/Unsteady/Output/Output Blocks/Base Output/"
+                    "Unsteady Time Series/Time"
+                ),
+            ),
+            hecras_cell_xy_path=cfg.get(
+                "hecras_cell_xy_path",
+                "Geometry/2D Flow Areas/per2/Cells Center Coordinate",
+            ),
+            hecras_cell_surface_area_path=cfg.get(
+                "hecras_cell_surface_area_path",
+                "Geometry/2D Flow Areas/per2/Cells Surface Area",
+            ),
         )
         sampler = DistributedSampler(
             dataset,
@@ -320,6 +368,21 @@ class MGNTrainer:
                     loss = loss + self.hecras_face_loss_weight * hecras_face_loss
                     loss_dict["hecras_face_loss"] = hecras_face_loss
                 if (
+                    self.use_hecras_cell_balance_loss
+                    and self.hecras_cell_balance_loss_weight > 0
+                ):
+                    hecras_cell_balance_loss = compute_hecras_cell_balance_loss(
+                        pred_one,
+                        graph,
+                        zone_mode=self.hecras_cell_balance_zone_mode,
+                    )
+                    loss = (
+                        loss
+                        + self.hecras_cell_balance_loss_weight
+                        * hecras_cell_balance_loss
+                    )
+                    loss_dict["hecras_cell_balance_loss"] = hecras_cell_balance_loss
+                if (
                     self.use_hecras_face_geometry_loss
                     and self.hecras_face_geometry_loss_weight > 0
                 ):
@@ -375,6 +438,21 @@ class MGNTrainer:
                     )
                     loss = loss + self.hecras_face_loss_weight * hecras_face_loss
                     loss_dict["hecras_face_loss"] = hecras_face_loss
+                if (
+                    self.use_hecras_cell_balance_loss
+                    and self.hecras_cell_balance_loss_weight > 0
+                ):
+                    hecras_cell_balance_loss = compute_hecras_cell_balance_loss(
+                        pred,
+                        graph,
+                        zone_mode=self.hecras_cell_balance_zone_mode,
+                    )
+                    loss = (
+                        loss
+                        + self.hecras_cell_balance_loss_weight
+                        * hecras_cell_balance_loss
+                    )
+                    loss_dict["hecras_cell_balance_loss"] = hecras_cell_balance_loss
                 if (
                     self.use_hecras_face_geometry_loss
                     and self.hecras_face_geometry_loss_weight > 0
