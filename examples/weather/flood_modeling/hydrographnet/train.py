@@ -42,6 +42,7 @@ from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
 from utils import (
     compute_edge_local_proxy_loss,
     compute_hecras_cell_balance_loss,
+    compute_hecras_edge_flow_loss,
     compute_hecras_face_geometry_loss,
     compute_hecras_face_local_loss,
     compute_physics_loss,
@@ -112,6 +113,15 @@ class MGNTrainer:
         )
         self.hecras_cell_balance_zone_mode = cfg.get(
             "hecras_cell_balance_zone_mode", "zone_weight"
+        )
+        self.use_hecras_edge_flow_loss = cfg.get(
+            "use_hecras_edge_flow_loss", False
+        )
+        self.hecras_edge_flow_loss_weight = cfg.get(
+            "hecras_edge_flow_loss_weight", 0.0
+        )
+        self.hecras_edge_flow_zone_mode = cfg.get(
+            "hecras_edge_flow_zone_mode", "zone_weight"
         )
 
         # Set activation function.
@@ -186,6 +196,9 @@ class MGNTrainer:
                 "hecras_cell_surface_area_path",
                 "Geometry/2D Flow Areas/per2/Cells Surface Area",
             ),
+            return_hecras_edge_flow=self.use_hecras_edge_flow_loss,
+            hecras_edge_flow_npz=cfg.get("hecras_edge_flow_npz"),
+            hecras_edge_flow_mode=cfg.get("hecras_edge_flow_mode", "all_touching"),
         )
         sampler = DistributedSampler(
             dataset,
@@ -383,6 +396,21 @@ class MGNTrainer:
                     )
                     loss_dict["hecras_cell_balance_loss"] = hecras_cell_balance_loss
                 if (
+                    self.use_hecras_edge_flow_loss
+                    and self.hecras_edge_flow_loss_weight > 0
+                ):
+                    hecras_edge_flow_loss = compute_hecras_edge_flow_loss(
+                        pred_one,
+                        graph,
+                        zone_mode=self.hecras_edge_flow_zone_mode,
+                    )
+                    loss = (
+                        loss
+                        + self.hecras_edge_flow_loss_weight
+                        * hecras_edge_flow_loss
+                    )
+                    loss_dict["hecras_edge_flow_loss"] = hecras_edge_flow_loss
+                if (
                     self.use_hecras_face_geometry_loss
                     and self.hecras_face_geometry_loss_weight > 0
                 ):
@@ -453,6 +481,21 @@ class MGNTrainer:
                         * hecras_cell_balance_loss
                     )
                     loss_dict["hecras_cell_balance_loss"] = hecras_cell_balance_loss
+                if (
+                    self.use_hecras_edge_flow_loss
+                    and self.hecras_edge_flow_loss_weight > 0
+                ):
+                    hecras_edge_flow_loss = compute_hecras_edge_flow_loss(
+                        pred,
+                        graph,
+                        zone_mode=self.hecras_edge_flow_zone_mode,
+                    )
+                    loss = (
+                        loss
+                        + self.hecras_edge_flow_loss_weight
+                        * hecras_edge_flow_loss
+                    )
+                    loss_dict["hecras_edge_flow_loss"] = hecras_edge_flow_loss
                 if (
                     self.use_hecras_face_geometry_loss
                     and self.hecras_face_geometry_loss_weight > 0

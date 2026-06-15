@@ -344,6 +344,9 @@ class HydroGraphDataset(Dataset):
         hecras_cell_surface_area_path: str = (
             "Geometry/2D Flow Areas/per2/Cells Surface Area"
         ),
+        return_hecras_edge_flow: bool = False,
+        hecras_edge_flow_npz: Optional[Union[str, Path]] = None,
+        hecras_edge_flow_mode: str = "all_touching",
         norm_stats_dir: Optional[Union[str, Path]] = None,
     ):
         if split not in {"train", "test"}:
@@ -386,6 +389,11 @@ class HydroGraphDataset(Dataset):
         self.hecras_result_time_path = hecras_result_time_path
         self.hecras_cell_xy_path = hecras_cell_xy_path
         self.hecras_cell_surface_area_path = hecras_cell_surface_area_path
+        self.return_hecras_edge_flow = return_hecras_edge_flow
+        self.hecras_edge_flow_npz = (
+            str(hecras_edge_flow_npz) if hecras_edge_flow_npz is not None else None
+        )
+        self.hecras_edge_flow_mode = hecras_edge_flow_mode
         self.norm_stats_dir = str(norm_stats_dir) if norm_stats_dir is not None else None
 
         # Placeholders for static and dynamic data, indices, and normalization stats.
@@ -402,6 +410,8 @@ class HydroGraphDataset(Dataset):
         self.hecras_face_velocity = None
         self.hecras_face_velocity_by_hydrograph = {}
         self.hecras_cell_balance_delta_by_hydrograph = {}
+        self.hecras_edge_flow_delta_by_hydrograph = {}
+        self.hecras_boundary_node_mask = None
 
         self.process()
 
@@ -600,6 +610,11 @@ class HydroGraphDataset(Dataset):
             self.hecras_cell_balance_delta_by_hydrograph = (
                 self.load_hecras_cell_balance_delta_by_hydrograph()
             )
+        if self.return_hecras_edge_flow:
+            self.hecras_edge_flow_delta_by_hydrograph = (
+                self.load_hecras_edge_flow_delta_by_hydrograph()
+            )
+            self.hecras_boundary_node_mask = self.load_hecras_boundary_node_mask()
 
         # Build sample indices for training (sliding window) or validate test data.
         if self.split == "train":
@@ -714,6 +729,10 @@ class HydroGraphDataset(Dataset):
                 self.add_hecras_face_attrs(g, t_idx, self.hydrograph_ids[hydro_idx])
             if self.return_hecras_cell_balance:
                 self.add_hecras_cell_balance_attrs(
+                    g, prev_time, self.hydrograph_ids[hydro_idx]
+                )
+            if self.return_hecras_edge_flow:
+                self.add_hecras_edge_flow_attrs(
                     g, prev_time, self.hydrograph_ids[hydro_idx]
                 )
 
@@ -871,6 +890,10 @@ class HydroGraphDataset(Dataset):
                 self.add_hecras_face_attrs(g, 0, self.hydrograph_ids[idx])
             if self.return_hecras_cell_balance:
                 self.add_hecras_cell_balance_attrs(
+                    g, self.n_time_steps - 1, self.hydrograph_ids[idx]
+                )
+            if self.return_hecras_edge_flow:
+                self.add_hecras_edge_flow_attrs(
                     g, self.n_time_steps - 1, self.hydrograph_ids[idx]
                 )
             rollout_data = {
@@ -1280,6 +1303,84 @@ class HydroGraphDataset(Dataset):
         graph.volume_std = torch.tensor(
             [self.dynamic_stats["volume"]["std"]], dtype=torch.float
         )
+
+    def load_hecras_edge_flow_delta_by_hydrograph(self) -> dict[str, np.ndarray]:
+        """Load precomputed HEC-RAS Face Flow deltas aligned to HGN intervals."""
+        if self.hecras_edge_flow_npz is None:
+            raise ValueError(
+                "return_hecras_edge_flow=True requires hecras_edge_flow_npz."
+            )
+        path = Path(self.hecras_edge_flow_npz)
+        if not path.exists():
+            raise FileNotFoundError(path)
+        data = np.load(path)
+        deltas = {}
+        suffix = f"_{self.hecras_edge_flow_mode}_edge_delta"
+        for key in data.files:
+            if key.endswith(suffix):
+                hydrograph_id = key[: -len(suffix)]
+                deltas[hydrograph_id] = np.asarray(data[key], dtype=np.float32)
+        if not deltas:
+            available = ", ".join(data.files)
+            raise KeyError(
+                f"No edge-flow arrays ending with {suffix!r} found in {path}. "
+                f"Available arrays: {available}"
+            )
+        return deltas
+
+    def add_hecras_edge_flow_attrs(
+        self, graph, transition_index: int, hydrograph_id: str
+    ) -> None:
+        """Attach one precomputed HEC-RAS Face Flow delta target."""
+        edge_flow_delta = self.hecras_edge_flow_delta_by_hydrograph.get(hydrograph_id)
+        if edge_flow_delta is None:
+            available = ", ".join(sorted(self.hecras_edge_flow_delta_by_hydrograph))
+            raise KeyError(
+                f"No HEC-RAS edge-flow target loaded for {hydrograph_id}. "
+                f"Available hydrographs: {available}"
+            )
+        if transition_index < 0 or transition_index >= edge_flow_delta.shape[0]:
+            raise IndexError(
+                f"HEC-RAS edge-flow transition index {transition_index} is outside "
+                f"0..{edge_flow_delta.shape[0] - 1} for {hydrograph_id}."
+            )
+        graph.hecras_edge_flow_delta = torch.tensor(
+            edge_flow_delta[transition_index], dtype=torch.float
+        )
+        if self.hecras_boundary_node_mask is not None:
+            graph.hecras_boundary_node_mask = torch.tensor(
+                self.hecras_boundary_node_mask, dtype=torch.bool
+            )
+        graph.volume_std = torch.tensor(
+            [self.dynamic_stats["volume"]["std"]], dtype=torch.float
+        )
+
+    def load_hecras_boundary_node_mask(self) -> Optional[np.ndarray]:
+        """Load nodes touched by HEC-RAS boundary/ghost faces, if available."""
+        if self.hecras_face_graph_file is None:
+            return None
+
+        path = Path(self.hecras_face_graph_file)
+        if not path.exists():
+            raise FileNotFoundError(path)
+
+        data = np.load(path)
+        if "boundary_face_cell_index" not in data.files:
+            return None
+
+        num_nodes = self.static_data["xy_coords"].shape[0]
+        boundary_cells = np.asarray(data["boundary_face_cell_index"], dtype=np.int64)
+        if "hdf_to_hgn_node_index" not in data.files:
+            return None
+        hdf_to_hgn = np.asarray(data["hdf_to_hgn_node_index"], dtype=np.int64)
+        if hdf_to_hgn.size == 0:
+            return None
+
+        mapped = hdf_to_hgn[boundary_cells.reshape(-1)]
+        mapped = mapped[(mapped >= 0) & (mapped < num_nodes)]
+        mask = np.zeros(num_nodes, dtype=np.bool_)
+        mask[mapped] = True
+        return mask
 
     def compute_local_source_rate(
         self, dyn: dict[str, np.ndarray], prev_time: int, target_time: int

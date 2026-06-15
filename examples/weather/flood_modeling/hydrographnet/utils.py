@@ -311,6 +311,56 @@ def compute_hecras_cell_balance_loss(pred, graph, zone_mode="zone_weight"):
     return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=pred.device)
 
 
+def compute_hecras_edge_flow_loss(pred, graph, zone_mode="zone_weight"):
+    """Compute an edge-informed HEC-RAS local storage-budget loss.
+
+    This objective compares the model's denormalized per-cell volume delta to a
+    precomputed target reconstructed from native HEC-RAS ``Face Flow`` over the
+    matching HGN interval.  The target is loaded separately from the
+    Cell-Flow-Balance branch so edge-flow ablations stay independent.
+    """
+    required_attrs = ("hecras_edge_flow_delta", "volume_std")
+    if not all(hasattr(graph, attr) for attr in required_attrs):
+        return torch.tensor(0.0, device=pred.device)
+
+    edge_delta = graph.hecras_edge_flow_delta.to(pred.device).reshape(-1)
+    batch = getattr(graph, "batch", None)
+    unique_ids = torch.unique(batch) if batch is not None else [None]
+    losses = []
+    for local_idx, uid in enumerate(unique_ids):
+        if uid is None:
+            node_mask = torch.ones(pred.shape[0], dtype=torch.bool, device=pred.device)
+        else:
+            node_mask = batch == uid
+
+        volume_std = graph.volume_std.reshape(-1)[local_idx].to(pred.device)
+        pred_delta = pred[node_mask, 1] * volume_std
+        residual = pred_delta - edge_delta[node_mask].to(pred.dtype)
+
+        weights = None
+        if zone_mode == "zone_weight" and hasattr(graph, "zone_weight"):
+            weights = graph.zone_weight[node_mask].to(pred.device)
+        elif zone_mode == "high" and hasattr(graph, "zone_label"):
+            weights = (graph.zone_label[node_mask].to(pred.device) == 3).to(pred.dtype)
+        elif (
+            zone_mode == "high_interior"
+            and hasattr(graph, "zone_label")
+            and hasattr(graph, "hecras_boundary_node_mask")
+        ):
+            high_mask = graph.zone_label[node_mask].to(pred.device) == 3
+            interior_mask = ~graph.hecras_boundary_node_mask[node_mask].to(pred.device)
+            weights = (high_mask & interior_mask).to(pred.dtype)
+        elif zone_mode == "all":
+            weights = torch.ones_like(residual)
+
+        if weights is not None and torch.sum(weights) > 0:
+            losses.append(torch.sum(weights * residual**2) / torch.sum(weights))
+        else:
+            losses.append(torch.mean(residual**2))
+
+    return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=pred.device)
+
+
 def compute_hecras_face_geometry_loss(
     pred,
     graph,

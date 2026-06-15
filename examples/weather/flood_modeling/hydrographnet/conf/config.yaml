@@ -100,6 +100,16 @@ hecras_result_time_path: "Results/Unsteady/Output/Output Blocks/Base Output/Unst
 hecras_cell_xy_path: "Geometry/2D Flow Areas/per2/Cells Center Coordinate"
 hecras_cell_surface_area_path: "Geometry/2D Flow Areas/per2/Cells Surface Area"
 
+# Formal HEC-RAS edge-flow branch. This uses a precomputed target reconstructed
+# from native HEC-RAS Face Flow over HGN intervals. It is intentionally separate
+# from the Cell Flow Balance branch so edge-informed ablations do not mix with
+# cell-level targets.
+use_hecras_edge_flow_loss: false
+hecras_edge_flow_loss_weight: 0.0
+hecras_edge_flow_zone_mode: zone_weight  # zone_weight, high, high_interior, or all
+hecras_edge_flow_npz: null
+hecras_edge_flow_mode: all_touching
+
 # Performance and optimization configurations.
 use_apex: True            # Use NVIDIA Apex for mixed precision if available.
 amp: False                # Automatic mixed precision flag.

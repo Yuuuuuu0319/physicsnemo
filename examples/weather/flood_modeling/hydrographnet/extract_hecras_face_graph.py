@@ -23,6 +23,10 @@ FACE_VELOCITY_PATH = (
     "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/"
     "2D Flow Areas/per2/Face Velocity"
 )
+FACE_FLOW_PATH = (
+    "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/"
+    "2D Flow Areas/per2/Face Flow"
+)
 
 
 def read_hdf_face_data(hdf_path: Path) -> dict[str, np.ndarray]:
@@ -42,6 +46,9 @@ def read_hdf_face_data(hdf_path: Path) -> dict[str, np.ndarray]:
         data["has_face_velocity"] = np.array(FACE_VELOCITY_PATH in hdf, dtype=bool)
         if FACE_VELOCITY_PATH in hdf:
             data["face_velocity_shape"] = np.asarray(hdf[FACE_VELOCITY_PATH].shape)
+        data["has_face_flow"] = np.array(FACE_FLOW_PATH in hdf, dtype=bool)
+        if FACE_FLOW_PATH in hdf:
+            data["face_flow_shape"] = np.asarray(hdf[FACE_FLOW_PATH].shape)
     return data
 
 
@@ -71,6 +78,7 @@ def validate_hgn_alignment(
     return {
         "num_hgn_nodes": int(num_nodes),
         "num_hdf_cells": int(hdf_cell_centers.shape[0]),
+        "mapping_mode": "hgn_node_index_equals_hdf_cell_index_for_first_num_hgn_nodes",
         "max_coordinate_distance": max_coordinate_distance,
         "mean_coordinate_distance": float(np.mean(coordinate_distance)),
         "area_rmse": float(np.sqrt(np.mean(area_delta**2))),
@@ -124,10 +132,16 @@ def main() -> None:
     internal_hdf_face_index = face_graph["internal_hdf_face_index"]
     boundary_hdf_face_index = face_graph["boundary_hdf_face_index"]
     normals = hdf_data["faces_normal_length"]
+    num_hgn_nodes = hgn_xy.shape[0]
+    hgn_to_hdf_cell_index = np.arange(num_hgn_nodes, dtype=np.int64)
+    hdf_to_hgn_node_index = np.full(hdf_data["cell_centers"].shape[0], -1, dtype=np.int64)
+    hdf_to_hgn_node_index[:num_hgn_nodes] = np.arange(num_hgn_nodes, dtype=np.int64)
 
     args.output_npz.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         args.output_npz,
+        hgn_to_hdf_cell_index=hgn_to_hdf_cell_index,
+        hdf_to_hgn_node_index=hdf_to_hgn_node_index,
         internal_face_index=face_graph["internal_face_index"],
         internal_hdf_face_index=internal_hdf_face_index,
         internal_normal_unit=normals[internal_hdf_face_index, :2],
@@ -139,6 +153,7 @@ def main() -> None:
         faces_facepoint_indexes=hdf_data["faces_facepoint_indexes"],
         facepoints_coordinate=hdf_data["facepoints_coordinate"],
         hdf_face_velocity_path=np.asarray(FACE_VELOCITY_PATH),
+        hdf_face_flow_path=np.asarray(FACE_FLOW_PATH),
     )
 
     summary = {
@@ -150,15 +165,24 @@ def main() -> None:
         "num_internal_hgn_faces": int(internal_hdf_face_index.shape[0]),
         "num_boundary_or_ghost_faces": int(boundary_hdf_face_index.shape[0]),
         "face_velocity_path": FACE_VELOCITY_PATH,
+        "face_flow_path": FACE_FLOW_PATH,
         "has_face_velocity": bool(hdf_data["has_face_velocity"]),
         "face_velocity_shape": (
             hdf_data["face_velocity_shape"].astype(int).tolist()
             if bool(hdf_data["has_face_velocity"])
             else None
         ),
+        "has_face_flow": bool(hdf_data["has_face_flow"]),
+        "face_flow_shape": (
+            hdf_data["face_flow_shape"].astype(int).tolist()
+            if bool(hdf_data["has_face_flow"])
+            else None
+        ),
         "notes": [
             "Only faces whose two cell indexes are both < num_hgn_nodes are included as internal HGN faces.",
             "Boundary/ghost faces are saved separately and are not mixed into the internal face graph.",
+            "This dataset currently aligns HGN node indexes to the first num_hgn_nodes HDF cell indexes by coordinate validation.",
+            "Native Face Flow is the preferred physical edge-flux source; Face Velocity should only be used as a fallback with geometry.",
             "The HDF face velocity dataset is event-specific; use its face indexes only when the HDF event matches the evaluated hydrograph.",
         ],
     }
