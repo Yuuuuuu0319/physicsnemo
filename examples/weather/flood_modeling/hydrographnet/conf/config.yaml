@@ -108,7 +108,29 @@ use_hecras_edge_flow_loss: false
 hecras_edge_flow_loss_weight: 0.0
 hecras_edge_flow_zone_mode: zone_weight  # zone_weight, high, high_interior, or all
 hecras_edge_flow_npz: null
-hecras_edge_flow_mode: all_touching
+hecras_edge_flow_face_stats_npz: null
+hecras_edge_flow_mode: all_touching  # all_touching or internal_plus_boundary_source
+
+# Experimental model-side internal edge-flux branch. Unlike
+# use_hecras_edge_flow_loss, this adds a small edge head that predicts signed
+# interval flux on the HEC-RAS internal face graph. The loss closes
+# node-volume prediction with explicit boundary/source terms.
+use_hecras_edge_flux_head: false
+hecras_edge_flux_head_loss_weight: 0.0
+hecras_edge_flux_head_zone_mode: zone_weight  # zone_weight, high, high_interior, or all
+hecras_edge_flux_head_closure_target_weight: 1.0
+hecras_edge_flux_head_divergence_target_weight: 1.0
+hecras_edge_flux_head_face_target_weight: 0.0
+hecras_edge_flux_head_face_loss_normalization: none  # none, target_rms, asinh_target_rms, signed_log1p_target_rms, per_face_rms, asinh_per_face_rms, or signed_log1p_per_face_rms
+hecras_edge_flux_head_hidden_dim: 128
+hecras_edge_flux_head_num_hidden_layers: 2
+hecras_edge_flux_head_scale: 1.0
+hecras_edge_flux_head_use_face_normal: false
+hecras_edge_flux_head_use_surface_features: false
+hecras_edge_flux_head_use_physical_surface_features: false
+hecras_edge_flux_head_use_previous_face_flow: false
+hecras_edge_flux_head_use_edge_physical_features: false
+hecras_edge_flux_head_output_mode: raw  # raw, per_face_rms, asinh_per_face_rms, or signed_log1p_per_face_rms
 
 # Performance and optimization configurations.
 use_apex: True            # Use NVIDIA Apex for mixed precision if available.

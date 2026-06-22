@@ -319,11 +319,28 @@ def compute_hecras_edge_flow_loss(pred, graph, zone_mode="zone_weight"):
     matching HGN interval.  The target is loaded separately from the
     Cell-Flow-Balance branch so edge-flow ablations stay independent.
     """
-    required_attrs = ("hecras_edge_flow_delta", "volume_std")
-    if not all(hasattr(graph, attr) for attr in required_attrs):
+    has_combined_target = hasattr(graph, "hecras_edge_flow_delta")
+    has_split_target = hasattr(graph, "hecras_edge_internal_delta") and hasattr(
+        graph, "hecras_edge_boundary_source_delta"
+    )
+    if not (has_combined_target or has_split_target) or not hasattr(graph, "volume_std"):
         return torch.tensor(0.0, device=pred.device)
 
-    edge_delta = graph.hecras_edge_flow_delta.to(pred.device).reshape(-1)
+    edge_delta = (
+        graph.hecras_edge_flow_delta.to(pred.device).reshape(-1)
+        if has_combined_target
+        else None
+    )
+    internal_delta = (
+        graph.hecras_edge_internal_delta.to(pred.device).reshape(-1)
+        if has_split_target
+        else None
+    )
+    boundary_delta = (
+        graph.hecras_edge_boundary_source_delta.to(pred.device).reshape(-1)
+        if has_split_target
+        else None
+    )
     batch = getattr(graph, "batch", None)
     unique_ids = torch.unique(batch) if batch is not None else [None]
     losses = []
@@ -335,7 +352,14 @@ def compute_hecras_edge_flow_loss(pred, graph, zone_mode="zone_weight"):
 
         volume_std = graph.volume_std.reshape(-1)[local_idx].to(pred.device)
         pred_delta = pred[node_mask, 1] * volume_std
-        residual = pred_delta - edge_delta[node_mask].to(pred.dtype)
+        if internal_delta is not None and boundary_delta is not None:
+            residual = (
+                pred_delta
+                - boundary_delta[node_mask].to(pred.dtype)
+                - internal_delta[node_mask].to(pred.dtype)
+            )
+        else:
+            residual = pred_delta - edge_delta[node_mask].to(pred.dtype)
 
         weights = None
         if zone_mode == "zone_weight" and hasattr(graph, "zone_weight"):
@@ -359,6 +383,237 @@ def compute_hecras_edge_flow_loss(pred, graph, zone_mode="zone_weight"):
             losses.append(torch.mean(residual**2))
 
     return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=pred.device)
+
+
+def compute_hecras_edge_flux_head_loss(
+    pred,
+    edge_flux_delta,
+    graph,
+    zone_mode="zone_weight",
+    closure_target_weight=1.0,
+    divergence_target_weight=1.0,
+    face_target_weight=0.0,
+    face_loss_normalization="none",
+):
+    """Compute a model-side internal edge-flux local-conservation loss.
+
+    ``edge_flux_delta`` is the model-predicted signed interval volume flux on
+    the HEC-RAS internal face graph. Its divergence is compared with the native
+    internal Face Flow target, while the node volume prediction is closed with
+    the explicit boundary/source residual.
+    """
+    required_attrs = (
+        "hecras_face_index",
+        "hecras_edge_internal_delta",
+        "hecras_edge_boundary_source_delta",
+        "volume_std",
+    )
+    if not all(hasattr(graph, attr) for attr in required_attrs):
+        zero = torch.tensor(0.0, device=pred.device)
+        return zero, {"hecras_edge_flux_divergence_loss": zero, "hecras_edge_flux_closure_loss": zero}
+
+    face_index = graph.hecras_face_index.to(pred.device)
+    if edge_flux_delta.numel() == 0 or face_index.numel() == 0:
+        zero = torch.tensor(0.0, device=pred.device)
+        return zero, {"hecras_edge_flux_divergence_loss": zero, "hecras_edge_flux_closure_loss": zero}
+
+    src, dst = face_index
+    internal_delta = graph.hecras_edge_internal_delta.to(pred.device).reshape(-1)
+    boundary_delta = graph.hecras_edge_boundary_source_delta.to(pred.device).reshape(-1)
+
+    batch = getattr(graph, "batch", None)
+    unique_ids = torch.unique(batch) if batch is not None else [None]
+    divergence_losses = []
+    closure_losses = []
+    face_losses = []
+    raw_face_losses = []
+    edge_flux_delta = edge_flux_delta.reshape(-1).to(pred.device)
+
+    for local_idx, uid in enumerate(unique_ids):
+        if uid is None:
+            node_mask = torch.ones(pred.shape[0], dtype=torch.bool, device=pred.device)
+            face_mask = torch.ones(src.shape[0], dtype=torch.bool, device=pred.device)
+            node_offset = 0
+        else:
+            node_mask = batch == uid
+            node_ids = torch.nonzero(node_mask, as_tuple=False).reshape(-1)
+            node_offset = int(node_ids[0].detach().item())
+            face_mask = node_mask[src] & node_mask[dst]
+
+        if not torch.any(face_mask):
+            continue
+
+        local_src = src[face_mask] - node_offset
+        local_dst = dst[face_mask] - node_offset
+        local_flux = edge_flux_delta[face_mask].to(pred.dtype)
+        divergence = torch.zeros(
+            int(torch.sum(node_mask).detach().item()), device=pred.device, dtype=pred.dtype
+        )
+        divergence.index_add_(0, local_src, -local_flux)
+        divergence.index_add_(0, local_dst, local_flux)
+
+        volume_std = graph.volume_std.reshape(-1)[local_idx].to(pred.device)
+        pred_delta = pred[node_mask, 1] * volume_std
+        internal_target = internal_delta[node_mask].to(pred.dtype)
+        boundary_target = boundary_delta[node_mask].to(pred.dtype)
+
+        divergence_residual = divergence - internal_target
+        closure_residual = pred_delta - boundary_target - divergence
+
+        weights = None
+        if zone_mode == "zone_weight" and hasattr(graph, "zone_weight"):
+            weights = graph.zone_weight[node_mask].to(pred.device)
+        elif zone_mode == "high" and hasattr(graph, "zone_label"):
+            weights = (graph.zone_label[node_mask].to(pred.device) == 3).to(pred.dtype)
+        elif (
+            zone_mode == "high_interior"
+            and hasattr(graph, "zone_label")
+            and hasattr(graph, "hecras_boundary_node_mask")
+        ):
+            high_mask = graph.zone_label[node_mask].to(pred.device) == 3
+            interior_mask = ~graph.hecras_boundary_node_mask[node_mask].to(pred.device)
+            weights = (high_mask & interior_mask).to(pred.dtype)
+        elif zone_mode == "all":
+            weights = torch.ones_like(divergence_residual)
+
+        if weights is not None and torch.sum(weights) > 0:
+            divergence_losses.append(
+                torch.sum(weights * divergence_residual**2) / torch.sum(weights)
+            )
+            closure_losses.append(
+                torch.sum(weights * closure_residual**2) / torch.sum(weights)
+            )
+        else:
+            divergence_losses.append(torch.mean(divergence_residual**2))
+            closure_losses.append(torch.mean(closure_residual**2))
+
+        if face_target_weight > 0 and hasattr(graph, "hecras_internal_face_flow_delta"):
+            face_target = graph.hecras_internal_face_flow_delta.to(pred.device).reshape(-1)
+            face_residual = edge_flux_delta[face_mask].to(pred.dtype) - face_target[
+                face_mask
+            ].to(pred.dtype)
+            face_weights = None
+            if zone_mode == "zone_weight" and hasattr(graph, "zone_weight"):
+                node_weights = graph.zone_weight.to(pred.device)
+                face_weights = 0.5 * (
+                    node_weights[src[face_mask]] + node_weights[dst[face_mask]]
+                )
+            elif zone_mode == "high" and hasattr(graph, "zone_label"):
+                labels = graph.zone_label.to(pred.device)
+                face_weights = (
+                    (labels[src[face_mask]] == 3) | (labels[dst[face_mask]] == 3)
+                ).to(pred.dtype)
+            elif zone_mode == "high_interior" and hasattr(graph, "zone_label"):
+                labels = graph.zone_label.to(pred.device)
+                face_weights = (
+                    (labels[src[face_mask]] == 3) & (labels[dst[face_mask]] == 3)
+                ).to(pred.dtype)
+            elif zone_mode == "all":
+                face_weights = torch.ones_like(face_residual)
+
+            local_face_target = face_target[face_mask].to(pred.dtype)
+            raw_face_residual = face_residual
+            if face_weights is not None and torch.sum(face_weights) > 0:
+                target_rms_sq = (
+                    torch.sum(face_weights * local_face_target**2)
+                    / torch.sum(face_weights)
+                )
+                raw_face_loss = (
+                    torch.sum(face_weights * raw_face_residual**2)
+                    / torch.sum(face_weights)
+                )
+            else:
+                target_rms_sq = torch.mean(local_face_target**2)
+                raw_face_loss = torch.mean(raw_face_residual**2)
+            target_rms = torch.sqrt(torch.clamp(target_rms_sq, min=1e-12))
+            scale = target_rms
+            if face_loss_normalization in (
+                "per_face_rms",
+                "asinh_per_face_rms",
+                "signed_log1p_per_face_rms",
+            ):
+                if not hasattr(graph, "hecras_internal_face_flow_rms"):
+                    raise AttributeError(
+                        f"face_loss_normalization={face_loss_normalization!r} "
+                        "requires graph.hecras_internal_face_flow_rms."
+                    )
+                scale = graph.hecras_internal_face_flow_rms.to(pred.device).reshape(-1)[
+                    face_mask
+                ].to(pred.dtype)
+                scale = torch.clamp(scale, min=1.0)
+            if face_loss_normalization in (
+                "per_face_rms",
+                "asinh_target_rms",
+                "signed_log1p_target_rms",
+                "asinh_per_face_rms",
+                "signed_log1p_per_face_rms",
+            ):
+                scaled_prediction = edge_flux_delta[face_mask].to(pred.dtype) / scale
+                scaled_target = local_face_target / scale
+                if face_loss_normalization in ("asinh_target_rms", "asinh_per_face_rms"):
+                    face_residual = torch.asinh(scaled_prediction) - torch.asinh(
+                        scaled_target
+                    )
+                elif face_loss_normalization in (
+                    "signed_log1p_target_rms",
+                    "signed_log1p_per_face_rms",
+                ):
+                    face_residual = torch.sign(scaled_prediction) * torch.log1p(
+                        torch.abs(scaled_prediction)
+                    ) - torch.sign(scaled_target) * torch.log1p(
+                        torch.abs(scaled_target)
+                    )
+                else:
+                    face_residual = scaled_prediction - scaled_target
+            if face_weights is not None and torch.sum(face_weights) > 0:
+                face_loss = (
+                    torch.sum(face_weights * face_residual**2) / torch.sum(face_weights)
+                )
+            else:
+                face_loss = torch.mean(face_residual**2)
+            raw_face_losses.append(raw_face_loss)
+            if face_loss_normalization == "target_rms":
+                face_loss = face_loss / torch.clamp(target_rms_sq, min=1e-12)
+            elif face_loss_normalization not in (
+                "none",
+                "asinh_target_rms",
+                "signed_log1p_target_rms",
+                "per_face_rms",
+                "asinh_per_face_rms",
+                "signed_log1p_per_face_rms",
+            ):
+                raise ValueError(
+                    "Unknown face_loss_normalization: "
+                    f"{face_loss_normalization!r}. Expected 'none', 'target_rms', "
+                    "'asinh_target_rms', 'signed_log1p_target_rms', "
+                    "'per_face_rms', 'asinh_per_face_rms', or "
+                    "'signed_log1p_per_face_rms'."
+                )
+            face_losses.append(face_loss)
+
+    if not divergence_losses:
+        zero = torch.tensor(0.0, device=pred.device)
+        return zero, {"hecras_edge_flux_divergence_loss": zero, "hecras_edge_flux_closure_loss": zero}
+
+    divergence_loss = torch.stack(divergence_losses).mean()
+    closure_loss = torch.stack(closure_losses).mean()
+    if face_losses:
+        face_loss = torch.stack(face_losses).mean()
+        raw_face_loss = torch.stack(raw_face_losses).mean()
+    else:
+        face_loss = torch.tensor(0.0, device=pred.device)
+        raw_face_loss = torch.tensor(0.0, device=pred.device)
+    total = (
+        closure_target_weight * closure_loss
+        + divergence_target_weight * divergence_loss
+        + face_target_weight * face_loss
+    )
+    return total, {
+        "hecras_edge_flux_divergence_loss": divergence_loss,
+        "hecras_edge_flux_closure_loss": closure_loss,
+        "hecras_edge_flux_face_loss": face_loss,
+        "hecras_edge_flux_raw_face_loss": raw_face_loss,
+    }
 
 
 def compute_hecras_face_geometry_loss(

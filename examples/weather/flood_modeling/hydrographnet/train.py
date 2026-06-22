@@ -43,6 +43,7 @@ from utils import (
     compute_edge_local_proxy_loss,
     compute_hecras_cell_balance_loss,
     compute_hecras_edge_flow_loss,
+    compute_hecras_edge_flux_head_loss,
     compute_hecras_face_geometry_loss,
     compute_hecras_face_local_loss,
     compute_physics_loss,
@@ -65,6 +66,185 @@ def collate_fn(batch):
         return batched_graph, physics_data
     else:
         return pyg.data.from_data_list(batch)
+
+
+class HecRasEdgeFluxHead(nn.Module):
+    """Small experiment-local head for signed internal HEC-RAS face flux."""
+
+    def __init__(
+        self,
+        num_node_features: int,
+        hidden_dim: int = 128,
+        num_hidden_layers: int = 2,
+        scale: float = 1.0,
+        use_face_normal: bool = False,
+        use_surface_features: bool = False,
+        use_physical_surface_features: bool = False,
+        use_previous_face_flow: bool = False,
+        use_edge_physical_features: bool = False,
+        output_mode: str = "raw",
+    ):
+        super().__init__()
+        self.scale = scale
+        self.num_hidden_layers = num_hidden_layers
+        self.use_face_normal = use_face_normal
+        self.use_surface_features = use_surface_features
+        self.use_physical_surface_features = use_physical_surface_features
+        self.use_previous_face_flow = use_previous_face_flow
+        self.use_edge_physical_features = use_edge_physical_features
+        self.output_mode = output_mode
+        allowed_output_modes = {
+            "raw",
+            "per_face_rms",
+            "asinh_per_face_rms",
+            "signed_log1p_per_face_rms",
+        }
+        if output_mode not in allowed_output_modes:
+            raise ValueError(
+                f"output_mode must be one of {sorted(allowed_output_modes)}, "
+                f"got {output_mode!r}."
+            )
+        input_dim = (
+            num_node_features * 2
+            + 1
+            + (2 if use_face_normal else 0)
+            + (4 if use_surface_features else 0)
+            + (4 if use_physical_surface_features else 0)
+            + (2 if use_previous_face_flow else 0)
+            + (12 if use_edge_physical_features else 0)
+        )
+        if num_hidden_layers < 1:
+            raise ValueError("num_hidden_layers must be at least 1.")
+        layers = [nn.Linear(input_dim, hidden_dim), nn.ReLU()]
+        for _ in range(num_hidden_layers - 1):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+        layers.append(nn.Linear(hidden_dim, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, graph):
+        face_index = graph.hecras_face_index
+        src, dst = face_index
+        if src.numel() == 0:
+            return graph.x.new_zeros((0,))
+        face_length = graph.hecras_face_length.to(graph.x.device).reshape(-1, 1)
+        face_length_scale = torch.clamp(torch.mean(face_length.detach()), min=1.0)
+        features = [graph.x[src], graph.x[dst], face_length / face_length_scale]
+        if self.use_face_normal:
+            if not hasattr(graph, "hecras_face_normal"):
+                raise AttributeError(
+                    "HecRasEdgeFluxHead(use_face_normal=True) requires "
+                    "graph.hecras_face_normal."
+                )
+            features.append(graph.hecras_face_normal.to(graph.x.device))
+        if self.use_surface_features:
+            latest_wd = graph.x[:, 13:14]
+            latest_volume = graph.x[:, 15:16]
+            surface_proxy = graph.x[:, 3:4] + latest_wd
+            source_rate = getattr(
+                graph,
+                "local_source_rate",
+                torch.zeros(graph.x.shape[0], device=graph.x.device),
+            )
+            source_rate = source_rate.to(graph.x.device).reshape(-1, 1)
+            source_scale = torch.clamp(
+                torch.sqrt(torch.mean(source_rate.detach() ** 2)), min=1.0
+            )
+            source_rate = source_rate / source_scale
+            features.extend(
+                [
+                    latest_wd[dst] - latest_wd[src],
+                    latest_volume[dst] - latest_volume[src],
+                    surface_proxy[dst] - surface_proxy[src],
+                    source_rate[dst] - source_rate[src],
+                ]
+            )
+        if self.use_physical_surface_features:
+            required = ("current_surface_elevation", "current_water_depth_denorm")
+            if not all(hasattr(graph, attr) for attr in required):
+                raise AttributeError(
+                    "HecRasEdgeFluxHead(use_physical_surface_features=True) "
+                    "requires graph.current_surface_elevation and "
+                    "graph.current_water_depth_denorm."
+                )
+            surface = graph.current_surface_elevation.to(graph.x.device).reshape(-1, 1)
+            depth = graph.current_water_depth_denorm.to(graph.x.device).reshape(-1, 1)
+            length_scale = torch.clamp(face_length, min=1.0)
+            surface_slope = (surface[dst] - surface[src]) / length_scale
+            depth_slope = (depth[dst] - depth[src]) / length_scale
+            surface_slope = surface_slope / torch.clamp(
+                torch.sqrt(torch.mean(surface_slope.detach() ** 2)), min=1e-6
+            )
+            depth_slope = depth_slope / torch.clamp(
+                torch.sqrt(torch.mean(depth_slope.detach() ** 2)), min=1e-6
+            )
+            features.extend(
+                [
+                    surface_slope,
+                    depth_slope,
+                    (depth[src] > 1e-6).to(graph.x.dtype),
+                    (depth[dst] > 1e-6).to(graph.x.dtype),
+                ]
+            )
+        if self.use_previous_face_flow:
+            if not hasattr(graph, "hecras_previous_internal_face_flow_delta"):
+                raise AttributeError(
+                    "HecRasEdgeFluxHead(use_previous_face_flow=True) requires "
+                    "graph.hecras_previous_internal_face_flow_delta."
+                )
+            previous_flow = graph.hecras_previous_internal_face_flow_delta.to(
+                graph.x.device
+            ).reshape(-1, 1)
+            if hasattr(graph, "hecras_internal_face_flow_rms"):
+                previous_scale = torch.clamp(
+                    graph.hecras_internal_face_flow_rms.to(graph.x.device).reshape(
+                        -1, 1
+                    ),
+                    min=1.0,
+                )
+            else:
+                previous_scale = torch.clamp(
+                    torch.sqrt(torch.mean(previous_flow.detach() ** 2)), min=1.0
+                )
+            previous_scaled = previous_flow / previous_scale
+            features.extend([previous_scaled, torch.asinh(previous_scaled)])
+        if self.use_edge_physical_features:
+            if not hasattr(graph, "hecras_edge_physical_features"):
+                raise AttributeError(
+                    "HecRasEdgeFluxHead(use_edge_physical_features=True) "
+                    "requires graph.hecras_edge_physical_features."
+                )
+            physical_features = graph.hecras_edge_physical_features.to(graph.x.device)
+            if physical_features.shape[1] != 12:
+                raise ValueError(
+                    "graph.hecras_edge_physical_features must have 12 columns, "
+                    f"got {physical_features.shape}."
+                )
+            feature_mean = physical_features.mean(dim=0, keepdim=True)
+            feature_std = torch.clamp(
+                physical_features.std(dim=0, unbiased=False, keepdim=True),
+                min=1e-6,
+            )
+            features.append((physical_features - feature_mean) / feature_std)
+        head_input = torch.cat(features, dim=1)
+        output = self.net(head_input).reshape(-1) * self.scale
+        if self.output_mode == "raw":
+            return output
+        if not hasattr(graph, "hecras_internal_face_flow_rms"):
+            raise AttributeError(
+                f"HecRasEdgeFluxHead(output_mode={self.output_mode!r}) requires "
+                "graph.hecras_internal_face_flow_rms."
+            )
+        face_scale = torch.clamp(
+            graph.hecras_internal_face_flow_rms.to(graph.x.device).reshape(-1),
+            min=1.0,
+        ).to(output.dtype)
+        if self.output_mode == "per_face_rms":
+            return output * face_scale
+        if self.output_mode == "asinh_per_face_rms":
+            return torch.sinh(torch.clamp(output, min=-20.0, max=20.0)) * face_scale
+        if self.output_mode == "signed_log1p_per_face_rms":
+            return torch.sign(output) * torch.expm1(torch.abs(output)) * face_scale
+        raise RuntimeError(f"Unhandled output_mode: {self.output_mode!r}")
 
 
 class MGNTrainer:
@@ -123,6 +303,51 @@ class MGNTrainer:
         self.hecras_edge_flow_zone_mode = cfg.get(
             "hecras_edge_flow_zone_mode", "zone_weight"
         )
+        self.use_hecras_edge_flux_head = cfg.get(
+            "use_hecras_edge_flux_head", False
+        )
+        self.hecras_edge_flux_head_loss_weight = cfg.get(
+            "hecras_edge_flux_head_loss_weight", 0.0
+        )
+        self.hecras_edge_flux_head_zone_mode = cfg.get(
+            "hecras_edge_flux_head_zone_mode", "zone_weight"
+        )
+        self.hecras_edge_flux_head_closure_target_weight = cfg.get(
+            "hecras_edge_flux_head_closure_target_weight", 1.0
+        )
+        self.hecras_edge_flux_head_divergence_target_weight = cfg.get(
+            "hecras_edge_flux_head_divergence_target_weight", 1.0
+        )
+        self.hecras_edge_flux_head_face_target_weight = cfg.get(
+            "hecras_edge_flux_head_face_target_weight", 0.0
+        )
+        self.hecras_edge_flux_head_face_loss_normalization = cfg.get(
+            "hecras_edge_flux_head_face_loss_normalization", "none"
+        )
+        self.hecras_edge_flux_head_hidden_dim = cfg.get(
+            "hecras_edge_flux_head_hidden_dim", 128
+        )
+        self.hecras_edge_flux_head_scale = cfg.get(
+            "hecras_edge_flux_head_scale", 1.0
+        )
+        self.hecras_edge_flux_head_use_face_normal = cfg.get(
+            "hecras_edge_flux_head_use_face_normal", False
+        )
+        self.hecras_edge_flux_head_use_surface_features = cfg.get(
+            "hecras_edge_flux_head_use_surface_features", False
+        )
+        self.hecras_edge_flux_head_use_physical_surface_features = cfg.get(
+            "hecras_edge_flux_head_use_physical_surface_features", False
+        )
+        self.hecras_edge_flux_head_use_previous_face_flow = cfg.get(
+            "hecras_edge_flux_head_use_previous_face_flow", False
+        )
+        self.hecras_edge_flux_head_use_edge_physical_features = cfg.get(
+            "hecras_edge_flux_head_use_edge_physical_features", False
+        )
+        self.hecras_edge_flux_head_output_mode = cfg.get(
+            "hecras_edge_flux_head_output_mode", "raw"
+        )
 
         # Set activation function.
         mlp_act = "relu"
@@ -152,6 +377,7 @@ class MGNTrainer:
             return_edge_local=self.use_edge_local_proxy,
             return_hecras_face=(
                 self.use_hecras_face_loss or self.use_hecras_face_geometry_loss
+                or self.use_hecras_edge_flux_head
             ),
             hecras_face_graph_file=cfg.get("hecras_face_graph_file"),
             hecras_face_velocity_file=cfg.get("hecras_face_velocity_file"),
@@ -196,9 +422,14 @@ class MGNTrainer:
                 "hecras_cell_surface_area_path",
                 "Geometry/2D Flow Areas/per2/Cells Surface Area",
             ),
-            return_hecras_edge_flow=self.use_hecras_edge_flow_loss,
+            return_hecras_edge_flow=(
+                self.use_hecras_edge_flow_loss or self.use_hecras_edge_flux_head
+            ),
             hecras_edge_flow_npz=cfg.get("hecras_edge_flow_npz"),
             hecras_edge_flow_mode=cfg.get("hecras_edge_flow_mode", "all_touching"),
+            hecras_edge_flow_face_stats_npz=cfg.get(
+                "hecras_edge_flow_face_stats_npz"
+            ),
         )
         sampler = DistributedSampler(
             dataset,
@@ -235,6 +466,31 @@ class MGNTrainer:
             self.model = self.model.to(self.dist.device)
         rank_zero_logger.info("Model instantiated successfully.")
 
+        self.edge_flux_head = None
+        if self.use_hecras_edge_flux_head:
+            rank_zero_logger.info("Instantiating HEC-RAS edge-flux head...")
+            self.edge_flux_head = HecRasEdgeFluxHead(
+                cfg.num_input_features,
+                hidden_dim=self.hecras_edge_flux_head_hidden_dim,
+                num_hidden_layers=cfg.get("hecras_edge_flux_head_num_hidden_layers", 2),
+                scale=self.hecras_edge_flux_head_scale,
+                use_face_normal=self.hecras_edge_flux_head_use_face_normal,
+                use_surface_features=(
+                    self.hecras_edge_flux_head_use_surface_features
+                ),
+                use_physical_surface_features=(
+                    self.hecras_edge_flux_head_use_physical_surface_features
+                ),
+                use_previous_face_flow=(
+                    self.hecras_edge_flux_head_use_previous_face_flow
+                ),
+                use_edge_physical_features=(
+                    self.hecras_edge_flux_head_use_edge_physical_features
+                ),
+                output_mode=self.hecras_edge_flux_head_output_mode,
+            ).to(self.dist.device)
+            rank_zero_logger.info("HEC-RAS edge-flux head instantiated successfully.")
+
         if cfg.watch_model and not cfg.jit and self.dist.rank == 0:
             wandb.watch(self.model)
 
@@ -247,14 +503,27 @@ class MGNTrainer:
                 broadcast_buffers=self.dist.broadcast_buffers,
                 find_unused_parameters=self.dist.find_unused_parameters,
             )
+            if self.edge_flux_head is not None:
+                self.edge_flux_head = DistributedDataParallel(
+                    self.edge_flux_head,
+                    device_ids=[self.dist.local_rank],
+                    output_device=self.dist.device,
+                    broadcast_buffers=self.dist.broadcast_buffers,
+                    find_unused_parameters=self.dist.find_unused_parameters,
+                )
 
         self.model.train()
+        if self.edge_flux_head is not None:
+            self.edge_flux_head.train()
         self.criterion = nn.MSELoss()
+        model_parameters = list(self.model.parameters())
+        if self.edge_flux_head is not None:
+            model_parameters += list(self.edge_flux_head.parameters())
         try:
             if cfg.use_apex:
                 from apex.optimizers import FusedAdam
 
-                self.optimizer = FusedAdam(self.model.parameters(), lr=cfg.lr)
+                self.optimizer = FusedAdam(model_parameters, lr=cfg.lr)
             else:
                 self.optimizer = None
         except ImportError:
@@ -263,7 +532,7 @@ class MGNTrainer:
             )
             self.optimizer = None
         if self.optimizer is None:
-            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=cfg.lr)
+            self.optimizer = torch.optim.Adam(model_parameters, lr=cfg.lr)
         rank_zero_logger.info(f"Using optimizer: {self.optimizer.__class__.__name__}")
 
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -276,7 +545,9 @@ class MGNTrainer:
             torch.distributed.barrier()
         self.epoch_init = load_checkpoint(
             to_absolute_path(cfg.ckpt_path),
-            models=self.model,
+            models=[self.model, self.edge_flux_head]
+            if self.edge_flux_head is not None
+            else self.model,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             scaler=self.scaler,
@@ -411,6 +682,35 @@ class MGNTrainer:
                     )
                     loss_dict["hecras_edge_flow_loss"] = hecras_edge_flow_loss
                 if (
+                    self.edge_flux_head is not None
+                    and self.hecras_edge_flux_head_loss_weight > 0
+                ):
+                    edge_flux_delta = self.edge_flux_head(graph)
+                    edge_flux_loss, edge_flux_metrics = compute_hecras_edge_flux_head_loss(
+                        pred_one,
+                        edge_flux_delta,
+                        graph,
+                        zone_mode=self.hecras_edge_flux_head_zone_mode,
+                        closure_target_weight=(
+                            self.hecras_edge_flux_head_closure_target_weight
+                        ),
+                        divergence_target_weight=(
+                            self.hecras_edge_flux_head_divergence_target_weight
+                        ),
+                        face_target_weight=(
+                            self.hecras_edge_flux_head_face_target_weight
+                        ),
+                        face_loss_normalization=(
+                            self.hecras_edge_flux_head_face_loss_normalization
+                        ),
+                    )
+                    loss = (
+                        loss
+                        + self.hecras_edge_flux_head_loss_weight * edge_flux_loss
+                    )
+                    loss_dict["hecras_edge_flux_head_loss"] = edge_flux_loss
+                    loss_dict.update(edge_flux_metrics)
+                if (
                     self.use_hecras_face_geometry_loss
                     and self.hecras_face_geometry_loss_weight > 0
                 ):
@@ -496,6 +796,35 @@ class MGNTrainer:
                         * hecras_edge_flow_loss
                     )
                     loss_dict["hecras_edge_flow_loss"] = hecras_edge_flow_loss
+                if (
+                    self.edge_flux_head is not None
+                    and self.hecras_edge_flux_head_loss_weight > 0
+                ):
+                    edge_flux_delta = self.edge_flux_head(graph)
+                    edge_flux_loss, edge_flux_metrics = compute_hecras_edge_flux_head_loss(
+                        pred,
+                        edge_flux_delta,
+                        graph,
+                        zone_mode=self.hecras_edge_flux_head_zone_mode,
+                        closure_target_weight=(
+                            self.hecras_edge_flux_head_closure_target_weight
+                        ),
+                        divergence_target_weight=(
+                            self.hecras_edge_flux_head_divergence_target_weight
+                        ),
+                        face_target_weight=(
+                            self.hecras_edge_flux_head_face_target_weight
+                        ),
+                        face_loss_normalization=(
+                            self.hecras_edge_flux_head_face_loss_normalization
+                        ),
+                    )
+                    loss = (
+                        loss
+                        + self.hecras_edge_flux_head_loss_weight * edge_flux_loss
+                    )
+                    loss_dict["hecras_edge_flux_head_loss"] = edge_flux_loss
+                    loss_dict.update(edge_flux_metrics)
                 if (
                     self.use_hecras_face_geometry_loss
                     and self.hecras_face_geometry_loss_weight > 0
@@ -589,7 +918,9 @@ def main(cfg: DictConfig) -> None:
         if dist.rank == 0:
             save_checkpoint(
                 to_absolute_path(cfg.ckpt_path),
-                models=trainer.model,
+                models=[trainer.model, trainer.edge_flux_head]
+                if trainer.edge_flux_head is not None
+                else trainer.model,
                 optimizer=trainer.optimizer,
                 scheduler=trainer.scheduler,
                 scaler=trainer.scaler,

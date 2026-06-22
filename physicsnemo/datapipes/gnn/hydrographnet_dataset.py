@@ -347,6 +347,7 @@ class HydroGraphDataset(Dataset):
         return_hecras_edge_flow: bool = False,
         hecras_edge_flow_npz: Optional[Union[str, Path]] = None,
         hecras_edge_flow_mode: str = "all_touching",
+        hecras_edge_flow_face_stats_npz: Optional[Union[str, Path]] = None,
         norm_stats_dir: Optional[Union[str, Path]] = None,
     ):
         if split not in {"train", "test"}:
@@ -394,6 +395,11 @@ class HydroGraphDataset(Dataset):
             str(hecras_edge_flow_npz) if hecras_edge_flow_npz is not None else None
         )
         self.hecras_edge_flow_mode = hecras_edge_flow_mode
+        self.hecras_edge_flow_face_stats_npz = (
+            str(hecras_edge_flow_face_stats_npz)
+            if hecras_edge_flow_face_stats_npz is not None
+            else None
+        )
         self.norm_stats_dir = str(norm_stats_dir) if norm_stats_dir is not None else None
 
         # Placeholders for static and dynamic data, indices, and normalization stats.
@@ -411,6 +417,7 @@ class HydroGraphDataset(Dataset):
         self.hecras_face_velocity_by_hydrograph = {}
         self.hecras_cell_balance_delta_by_hydrograph = {}
         self.hecras_edge_flow_delta_by_hydrograph = {}
+        self.hecras_edge_flow_face_stats = None
         self.hecras_boundary_node_mask = None
 
         self.process()
@@ -614,6 +621,7 @@ class HydroGraphDataset(Dataset):
             self.hecras_edge_flow_delta_by_hydrograph = (
                 self.load_hecras_edge_flow_delta_by_hydrograph()
             )
+            self.hecras_edge_flow_face_stats = self.load_hecras_edge_flow_face_stats()
             self.hecras_boundary_node_mask = self.load_hecras_boundary_node_mask()
 
         # Build sample indices for training (sliding window) or validate test data.
@@ -713,8 +721,25 @@ class HydroGraphDataset(Dataset):
                     [self.dynamic_stats["volume"]["std"]], dtype=torch.float
                 )
             if self.return_hecras_face:
+                current_wd = dyn["water_depth"][prev_time, :]
+                current_wd_denorm = self.denormalize(
+                    current_wd,
+                    self.dynamic_stats["water_depth"]["mean"],
+                    self.dynamic_stats["water_depth"]["std"],
+                )
+                elevation_denorm = self.denormalize(
+                    sd["elevation"],
+                    self.static_stats["elevation"]["mean"],
+                    self.static_stats["elevation"]["std"],
+                ).reshape(-1)
                 g.current_water_depth = torch.tensor(
-                    dyn["water_depth"][prev_time, :], dtype=torch.float
+                    current_wd, dtype=torch.float
+                )
+                g.current_water_depth_denorm = torch.tensor(
+                    current_wd_denorm, dtype=torch.float
+                )
+                g.current_surface_elevation = torch.tensor(
+                    elevation_denorm + current_wd_denorm, dtype=torch.float
                 )
                 g.water_depth_mean = torch.tensor(
                     [self.dynamic_stats["water_depth"]["mean"]], dtype=torch.float
@@ -872,8 +897,25 @@ class HydroGraphDataset(Dataset):
                     [self.dynamic_stats["volume"]["std"]], dtype=torch.float
                 )
             if self.return_hecras_face:
+                current_wd = dyn["water_depth"][self.n_time_steps - 1, :]
+                current_wd_denorm = self.denormalize(
+                    current_wd,
+                    self.dynamic_stats["water_depth"]["mean"],
+                    self.dynamic_stats["water_depth"]["std"],
+                )
+                elevation_denorm = self.denormalize(
+                    sd["elevation"],
+                    self.static_stats["elevation"]["mean"],
+                    self.static_stats["elevation"]["std"],
+                ).reshape(-1)
                 g.current_water_depth = torch.tensor(
-                    dyn["water_depth"][self.n_time_steps - 1, :], dtype=torch.float
+                    current_wd, dtype=torch.float
+                )
+                g.current_water_depth_denorm = torch.tensor(
+                    current_wd_denorm, dtype=torch.float
+                )
+                g.current_surface_elevation = torch.tensor(
+                    elevation_denorm + current_wd_denorm, dtype=torch.float
                 )
                 g.water_depth_mean = torch.tensor(
                     [self.dynamic_stats["water_depth"]["mean"]], dtype=torch.float
@@ -1149,6 +1191,7 @@ class HydroGraphDataset(Dataset):
         face_data = np.load(self.hecras_face_graph_file)
         face_index = face_data["internal_face_index"].astype(np.int64)
         face_length = face_data["internal_face_length"].astype(np.float32)
+        face_normal = face_data["internal_normal_unit"].astype(np.float32)
         hdf_face_index = face_data["internal_hdf_face_index"].astype(np.int64)
         if face_index.shape[0] != 2:
             raise ValueError(
@@ -1162,9 +1205,12 @@ class HydroGraphDataset(Dataset):
             raise ValueError("HEC-RAS face length count does not match face count.")
         if hdf_face_index.shape[0] != face_index.shape[1]:
             raise ValueError("HEC-RAS HDF face index count does not match face count.")
+        if face_normal.shape[0] != face_index.shape[1] or face_normal.shape[1] != 2:
+            raise ValueError("HEC-RAS face normal shape must be (num_faces, 2).")
         return {
             "face_index": face_index,
             "face_length": face_length,
+            "face_normal": face_normal,
             "hdf_face_index": hdf_face_index,
         }
 
@@ -1248,8 +1294,72 @@ class HydroGraphDataset(Dataset):
         graph.hecras_face_length = torch.tensor(
             self.hecras_face_graph["face_length"], dtype=torch.float
         )
+        graph.hecras_face_normal = torch.tensor(
+            self.hecras_face_graph["face_normal"], dtype=torch.float
+        )
         graph.hecras_node_area = torch.tensor(
             self.static_data["area_denorm"].reshape(-1), dtype=torch.float
+        )
+        src, dst = self.hecras_face_graph["face_index"]
+        xy = self.static_data_raw_xy
+        center_dx = xy[dst, 0] - xy[src, 0]
+        center_dy = xy[dst, 1] - xy[src, 1]
+        center_distance = np.sqrt(center_dx * center_dx + center_dy * center_dy)
+        elevation = self.denormalize(
+            self.static_data["elevation"],
+            self.static_stats["elevation"]["mean"],
+            self.static_stats["elevation"]["std"],
+        ).reshape(-1)
+        manning = self.denormalize(
+            self.static_data["manning"],
+            self.static_stats["manning"]["mean"],
+            self.static_stats["manning"]["std"],
+        ).reshape(-1)
+        infiltration = self.denormalize(
+            self.static_data["infiltration"],
+            self.static_stats["infiltration"]["mean"],
+            self.static_stats["infiltration"]["std"],
+        ).reshape(-1)
+        area = self.static_data["area_denorm"].reshape(-1)
+        elevation_diff = elevation[dst] - elevation[src]
+        bed_slope = elevation_diff / np.maximum(center_distance, 1e-6)
+        manning_mean = 0.5 * (manning[src] + manning[dst])
+        manning_diff = manning[dst] - manning[src]
+        infiltration_mean = 0.5 * (infiltration[src] + infiltration[dst])
+        infiltration_diff = infiltration[dst] - infiltration[src]
+        area_mean = 0.5 * (area[src] + area[dst])
+        area_ratio = np.maximum(area[src], area[dst]) / np.maximum(
+            np.minimum(area[src], area[dst]), 1e-6
+        )
+        if self.use_fidelity_zones:
+            zone_src = self.zone_label[src]
+            zone_dst = self.zone_label[dst]
+            same_zone = (zone_src == zone_dst).astype(np.float32)
+            zone3_touching = ((zone_src == 3) | (zone_dst == 3)).astype(np.float32)
+            zone3_internal = ((zone_src == 3) & (zone_dst == 3)).astype(np.float32)
+        else:
+            same_zone = np.ones_like(center_distance, dtype=np.float32)
+            zone3_touching = np.zeros_like(center_distance, dtype=np.float32)
+            zone3_internal = np.zeros_like(center_distance, dtype=np.float32)
+        graph.hecras_edge_physical_features = torch.tensor(
+            np.stack(
+                [
+                    center_distance,
+                    elevation_diff,
+                    bed_slope,
+                    manning_mean,
+                    manning_diff,
+                    infiltration_mean,
+                    infiltration_diff,
+                    area_mean,
+                    area_ratio,
+                    same_zone,
+                    zone3_touching,
+                    zone3_internal,
+                ],
+                axis=1,
+            ),
+            dtype=torch.float,
         )
         graph.volume_std = torch.tensor(
             [self.dynamic_stats["volume"]["std"]], dtype=torch.float
@@ -1315,6 +1425,50 @@ class HydroGraphDataset(Dataset):
             raise FileNotFoundError(path)
         data = np.load(path)
         deltas = {}
+        if self.hecras_edge_flow_mode == "internal_plus_boundary_source":
+            internal_suffix = "_internal_edge_delta"
+            boundary_suffix = "_boundary_source_delta"
+            face_suffix = "_internal_face_delta"
+            internal = {}
+            boundary = {}
+            face = {}
+            for key in data.files:
+                if key.endswith(internal_suffix):
+                    hydrograph_id = key[: -len(internal_suffix)]
+                    internal[hydrograph_id] = np.asarray(data[key], dtype=np.float32)
+                elif key.endswith(boundary_suffix):
+                    hydrograph_id = key[: -len(boundary_suffix)]
+                    boundary[hydrograph_id] = np.asarray(data[key], dtype=np.float32)
+                elif key.endswith(face_suffix):
+                    hydrograph_id = key[: -len(face_suffix)]
+                    face[hydrograph_id] = np.asarray(data[key], dtype=np.float32)
+            missing_boundary = sorted(set(internal) - set(boundary))
+            missing_internal = sorted(set(boundary) - set(internal))
+            if missing_boundary or missing_internal:
+                raise KeyError(
+                    "internal_plus_boundary_source requires paired arrays. "
+                    f"Missing boundary for: {missing_boundary}; "
+                    f"missing internal for: {missing_internal}."
+                )
+            if not internal:
+                available = ", ".join(data.files)
+                raise KeyError(
+                    "No paired internal/boundary edge-flow arrays found in "
+                    f"{path}. Available arrays: {available}"
+                )
+            return {
+                hydrograph_id: {
+                    "internal": internal[hydrograph_id],
+                    "boundary": boundary[hydrograph_id],
+                    **(
+                        {"face": face[hydrograph_id]}
+                        if hydrograph_id in face
+                        else {}
+                    ),
+                }
+                for hydrograph_id in sorted(internal)
+            }
+
         suffix = f"_{self.hecras_edge_flow_mode}_edge_delta"
         for key in data.files:
             if key.endswith(suffix):
@@ -1328,25 +1482,95 @@ class HydroGraphDataset(Dataset):
             )
         return deltas
 
+    def load_hecras_edge_flow_face_stats(self) -> Optional[dict[str, np.ndarray]]:
+        """Load per-internal-face target statistics for edge-flux losses."""
+        if self.hecras_edge_flow_face_stats_npz is None:
+            return None
+        path = Path(self.hecras_edge_flow_face_stats_npz)
+        if not path.exists():
+            raise FileNotFoundError(path)
+        data = np.load(path)
+        required = ("face_mean", "face_std", "face_rms")
+        missing = [key for key in required if key not in data.files]
+        if missing:
+            raise KeyError(
+                f"Missing arrays {missing} in HEC-RAS edge-flow face stats {path}."
+            )
+        stats = {
+            key: np.asarray(data[key], dtype=np.float32).reshape(-1)
+            for key in required
+        }
+        if self.hecras_face_graph is not None:
+            expected_faces = self.hecras_face_graph["face_index"].shape[1]
+            for key, value in stats.items():
+                if value.shape[0] != expected_faces:
+                    raise ValueError(
+                        f"{key} has {value.shape[0]} entries, but face graph has "
+                        f"{expected_faces} internal faces."
+                    )
+        return stats
+
     def add_hecras_edge_flow_attrs(
         self, graph, transition_index: int, hydrograph_id: str
     ) -> None:
         """Attach one precomputed HEC-RAS Face Flow delta target."""
-        edge_flow_delta = self.hecras_edge_flow_delta_by_hydrograph.get(hydrograph_id)
-        if edge_flow_delta is None:
+        edge_flow_target = self.hecras_edge_flow_delta_by_hydrograph.get(hydrograph_id)
+        if edge_flow_target is None:
             available = ", ".join(sorted(self.hecras_edge_flow_delta_by_hydrograph))
             raise KeyError(
                 f"No HEC-RAS edge-flow target loaded for {hydrograph_id}. "
                 f"Available hydrographs: {available}"
             )
-        if transition_index < 0 or transition_index >= edge_flow_delta.shape[0]:
+        if isinstance(edge_flow_target, dict):
+            target_length = edge_flow_target["internal"].shape[0]
+        else:
+            target_length = edge_flow_target.shape[0]
+        if transition_index < 0 or transition_index >= target_length:
             raise IndexError(
                 f"HEC-RAS edge-flow transition index {transition_index} is outside "
-                f"0..{edge_flow_delta.shape[0] - 1} for {hydrograph_id}."
+                f"0..{target_length - 1} for {hydrograph_id}."
             )
-        graph.hecras_edge_flow_delta = torch.tensor(
-            edge_flow_delta[transition_index], dtype=torch.float
-        )
+        if isinstance(edge_flow_target, dict):
+            internal_delta = edge_flow_target["internal"][transition_index]
+            boundary_delta = edge_flow_target["boundary"][transition_index]
+            graph.hecras_edge_internal_delta = torch.tensor(
+                internal_delta, dtype=torch.float
+            )
+            graph.hecras_edge_boundary_source_delta = torch.tensor(
+                boundary_delta, dtype=torch.float
+            )
+            graph.hecras_edge_flow_delta = torch.tensor(
+                internal_delta + boundary_delta, dtype=torch.float
+            )
+            if "face" in edge_flow_target:
+                previous_face_delta = (
+                    np.zeros_like(edge_flow_target["face"][transition_index])
+                    if transition_index == 0
+                    else edge_flow_target["face"][transition_index - 1]
+                )
+                graph.hecras_internal_face_flow_delta = torch.tensor(
+                    edge_flow_target["face"][transition_index], dtype=torch.float
+                )
+                graph.hecras_previous_internal_face_flow_delta = torch.tensor(
+                    previous_face_delta, dtype=torch.float
+                )
+                if self.hecras_edge_flow_face_stats is not None:
+                    graph.hecras_internal_face_flow_mean = torch.tensor(
+                        self.hecras_edge_flow_face_stats["face_mean"],
+                        dtype=torch.float,
+                    )
+                    graph.hecras_internal_face_flow_std = torch.tensor(
+                        self.hecras_edge_flow_face_stats["face_std"],
+                        dtype=torch.float,
+                    )
+                    graph.hecras_internal_face_flow_rms = torch.tensor(
+                        self.hecras_edge_flow_face_stats["face_rms"],
+                        dtype=torch.float,
+                    )
+        else:
+            graph.hecras_edge_flow_delta = torch.tensor(
+                edge_flow_target[transition_index], dtype=torch.float
+            )
         if self.hecras_boundary_node_mask is not None:
             graph.hecras_boundary_node_mask = torch.tensor(
                 self.hecras_boundary_node_mask, dtype=torch.bool

@@ -258,7 +258,13 @@ def main() -> None:
     parser.add_argument("--output-npz", type=Path)
     parser.add_argument(
         "--store-mode",
-        choices=("all", "internal", "all_touching"),
+        choices=(
+            "all",
+            "internal",
+            "all_touching",
+            "boundary_source",
+            "internal_plus_boundary_source",
+        ),
         default="all",
         help="Which edge-flow delta arrays to store in --output-npz.",
     )
@@ -268,6 +274,7 @@ def main() -> None:
     hdf_paths = load_hdf_paths(args.hdf_glob)
     face_graph = np.load(args.face_graph_npz)
     hdf_to_hgn = face_graph["hdf_to_hgn_node_index"].astype(np.int64)
+    internal_hdf_face_index = face_graph["internal_hdf_face_index"].astype(np.int64)
     num_nodes = int(np.sum(hdf_to_hgn >= 0))
     zone_path = args.data_dir / "zone_label.txt"
     zone_label = (
@@ -295,9 +302,11 @@ def main() -> None:
             )
             balance_delta = integrate_intervals(balance, hdf_time_seconds, hdf_indices)
 
+            event_edge_deltas = {}
             for mode in ("internal", "all_touching"):
                 net_flow = signed_face_sum(face_flow, face_cells, hdf_to_hgn, num_nodes, mode)
                 edge_delta = integrate_intervals(net_flow, hdf_time_seconds, hdf_indices)
+                event_edge_deltas[mode] = edge_delta
                 rows.append(
                     summarize_residual(event_id, mode, edge_delta, balance_delta, zone_label)
                 )
@@ -306,6 +315,32 @@ def main() -> None:
                         edge_deltas[f"{event_id}_{mode}_edge_delta"] = (
                             edge_delta.astype(np.float32)
                         )
+            if args.output_npz and args.store_mode in {
+                "all",
+                "boundary_source",
+                "internal_plus_boundary_source",
+            }:
+                boundary_source = (
+                    event_edge_deltas["all_touching"] - event_edge_deltas["internal"]
+                )
+                edge_deltas[f"{event_id}_boundary_source_delta"] = (
+                    boundary_source.astype(np.float32)
+                )
+            if args.output_npz and args.store_mode in {
+                "all",
+                "internal_plus_boundary_source",
+            }:
+                edge_deltas[f"{event_id}_internal_edge_delta"] = (
+                    event_edge_deltas["internal"].astype(np.float32)
+                )
+                internal_face_delta = integrate_intervals(
+                    face_flow[:, internal_hdf_face_index],
+                    hdf_time_seconds,
+                    hdf_indices,
+                )
+                edge_deltas[f"{event_id}_internal_face_delta"] = (
+                    internal_face_delta.astype(np.float32)
+                )
             if args.output_npz:
                 edge_deltas[f"{event_id}_cell_balance_delta"] = balance_delta.astype(
                     np.float32
