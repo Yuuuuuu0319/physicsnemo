@@ -390,6 +390,8 @@ def compute_hecras_edge_flux_head_loss(
     edge_flux_delta,
     graph,
     zone_mode="zone_weight",
+    zone_high_weight=1.0,
+    zone_low_weight=1.0,
     closure_target_weight=1.0,
     divergence_target_weight=1.0,
     face_target_weight=0.0,
@@ -463,6 +465,19 @@ def compute_hecras_edge_flux_head_loss(
         weights = None
         if zone_mode == "zone_weight" and hasattr(graph, "zone_weight"):
             weights = graph.zone_weight[node_mask].to(pred.device)
+        elif zone_mode == "zone_weighted" and hasattr(graph, "zone_label"):
+            labels = graph.zone_label[node_mask].to(pred.device)
+            weights = torch.full_like(
+                divergence_residual,
+                float(zone_low_weight),
+                dtype=pred.dtype,
+                device=pred.device,
+            )
+            weights = torch.where(
+                labels == 3,
+                torch.full_like(weights, float(zone_high_weight)),
+                weights,
+            )
         elif zone_mode == "high" and hasattr(graph, "zone_label"):
             weights = (graph.zone_label[node_mask].to(pred.device) == 3).to(pred.dtype)
         elif (
@@ -498,6 +513,21 @@ def compute_hecras_edge_flux_head_loss(
                 face_weights = 0.5 * (
                     node_weights[src[face_mask]] + node_weights[dst[face_mask]]
                 )
+            elif zone_mode == "zone_weighted" and hasattr(graph, "zone_label"):
+                labels = graph.zone_label.to(pred.device)
+                src_high = labels[src[face_mask]] == 3
+                dst_high = labels[dst[face_mask]] == 3
+                src_weights = torch.where(
+                    src_high,
+                    torch.full_like(face_residual, float(zone_high_weight)),
+                    torch.full_like(face_residual, float(zone_low_weight)),
+                )
+                dst_weights = torch.where(
+                    dst_high,
+                    torch.full_like(face_residual, float(zone_high_weight)),
+                    torch.full_like(face_residual, float(zone_low_weight)),
+                )
+                face_weights = 0.5 * (src_weights + dst_weights)
             elif zone_mode == "high" and hasattr(graph, "zone_label"):
                 labels = graph.zone_label.to(pred.device)
                 face_weights = (
@@ -526,38 +556,95 @@ def compute_hecras_edge_flux_head_loss(
                 target_rms_sq = torch.mean(local_face_target**2)
                 raw_face_loss = torch.mean(raw_face_residual**2)
             target_rms = torch.sqrt(torch.clamp(target_rms_sq, min=1e-12))
-            scale = target_rms
-            if face_loss_normalization in (
-                "per_face_rms",
-                "asinh_per_face_rms",
-                "signed_log1p_per_face_rms",
-            ):
+            scale_mode = face_loss_normalization
+            for prefix in ("asinh_", "signed_log1p_"):
+                if scale_mode.startswith(prefix):
+                    scale_mode = scale_mode[len(prefix) :]
+                    break
+            scale = torch.clamp(target_rms, min=1.0)
+            if scale_mode in ("per_face_rms", "face_event_rms", "face_transition_rms"):
                 if not hasattr(graph, "hecras_internal_face_flow_rms"):
                     raise AttributeError(
                         f"face_loss_normalization={face_loss_normalization!r} "
                         "requires graph.hecras_internal_face_flow_rms."
                     )
-                scale = graph.hecras_internal_face_flow_rms.to(pred.device).reshape(-1)[
+                face_scale = graph.hecras_internal_face_flow_rms.to(pred.device).reshape(-1)[
                     face_mask
                 ].to(pred.dtype)
-                scale = torch.clamp(scale, min=1.0)
-            if face_loss_normalization in (
+                face_scale = torch.clamp(face_scale, min=1.0)
+                if scale_mode == "per_face_rms":
+                    scale = face_scale
+                else:
+                    if not hasattr(graph, "hecras_internal_face_flow_global_rms"):
+                        raise AttributeError(
+                            f"face_loss_normalization={face_loss_normalization!r} "
+                            "requires graph.hecras_internal_face_flow_global_rms."
+                        )
+                    global_scale = torch.clamp(
+                        graph.hecras_internal_face_flow_global_rms.to(
+                            pred.device
+                        ).reshape(-1)[0],
+                        min=1.0,
+                    ).to(pred.dtype)
+                    if scale_mode == "face_event_rms":
+                        if not hasattr(graph, "hecras_internal_face_flow_event_rms"):
+                            raise AttributeError(
+                                f"face_loss_normalization={face_loss_normalization!r} "
+                                "requires graph.hecras_internal_face_flow_event_rms."
+                            )
+                        event_scale = torch.clamp(
+                            graph.hecras_internal_face_flow_event_rms.to(
+                                pred.device
+                            ).reshape(-1)[0],
+                            min=1.0,
+                        ).to(pred.dtype)
+                        scale = face_scale * event_scale / global_scale
+                    else:
+                        if not hasattr(
+                            graph, "hecras_internal_face_flow_transition_rms"
+                        ):
+                            raise AttributeError(
+                                f"face_loss_normalization={face_loss_normalization!r} "
+                                "requires "
+                                "graph.hecras_internal_face_flow_transition_rms."
+                            )
+                        transition_scale = torch.clamp(
+                            graph.hecras_internal_face_flow_transition_rms.to(
+                                pred.device
+                            ).reshape(-1)[0],
+                            min=1.0,
+                        ).to(pred.dtype)
+                        scale = face_scale * transition_scale / global_scale
+            elif scale_mode in ("event_rms", "transition_rms"):
+                attr = (
+                    "hecras_internal_face_flow_event_rms"
+                    if scale_mode == "event_rms"
+                    else "hecras_internal_face_flow_transition_rms"
+                )
+                if not hasattr(graph, attr):
+                    raise AttributeError(
+                        f"face_loss_normalization={face_loss_normalization!r} "
+                        f"requires graph.{attr}."
+                    )
+                scale = torch.clamp(
+                    getattr(graph, attr).to(pred.device).reshape(-1)[0],
+                    min=1.0,
+                ).to(pred.dtype)
+            if face_loss_normalization != "none" and scale_mode in (
+                "target_rms",
                 "per_face_rms",
-                "asinh_target_rms",
-                "signed_log1p_target_rms",
-                "asinh_per_face_rms",
-                "signed_log1p_per_face_rms",
+                "event_rms",
+                "transition_rms",
+                "face_event_rms",
+                "face_transition_rms",
             ):
                 scaled_prediction = edge_flux_delta[face_mask].to(pred.dtype) / scale
                 scaled_target = local_face_target / scale
-                if face_loss_normalization in ("asinh_target_rms", "asinh_per_face_rms"):
+                if face_loss_normalization.startswith("asinh_"):
                     face_residual = torch.asinh(scaled_prediction) - torch.asinh(
                         scaled_target
                     )
-                elif face_loss_normalization in (
-                    "signed_log1p_target_rms",
-                    "signed_log1p_per_face_rms",
-                ):
+                elif face_loss_normalization.startswith("signed_log1p_"):
                     face_residual = torch.sign(scaled_prediction) * torch.log1p(
                         torch.abs(scaled_prediction)
                     ) - torch.sign(scaled_target) * torch.log1p(
@@ -581,13 +668,22 @@ def compute_hecras_edge_flux_head_loss(
                 "per_face_rms",
                 "asinh_per_face_rms",
                 "signed_log1p_per_face_rms",
+                "event_rms",
+                "asinh_event_rms",
+                "signed_log1p_event_rms",
+                "transition_rms",
+                "asinh_transition_rms",
+                "signed_log1p_transition_rms",
+                "face_event_rms",
+                "asinh_face_event_rms",
+                "signed_log1p_face_event_rms",
+                "face_transition_rms",
+                "asinh_face_transition_rms",
+                "signed_log1p_face_transition_rms",
             ):
                 raise ValueError(
                     "Unknown face_loss_normalization: "
-                    f"{face_loss_normalization!r}. Expected 'none', 'target_rms', "
-                    "'asinh_target_rms', 'signed_log1p_target_rms', "
-                    "'per_face_rms', 'asinh_per_face_rms', or "
-                    "'signed_log1p_per_face_rms'."
+                    f"{face_loss_normalization!r}."
                 )
             face_losses.append(face_loss)
 

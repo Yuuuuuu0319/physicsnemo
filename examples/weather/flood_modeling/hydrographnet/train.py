@@ -96,8 +96,20 @@ class HecRasEdgeFluxHead(nn.Module):
         allowed_output_modes = {
             "raw",
             "per_face_rms",
+            "event_rms",
+            "transition_rms",
+            "face_event_rms",
+            "face_transition_rms",
             "asinh_per_face_rms",
+            "asinh_event_rms",
+            "asinh_transition_rms",
+            "asinh_face_event_rms",
+            "asinh_face_transition_rms",
             "signed_log1p_per_face_rms",
+            "signed_log1p_event_rms",
+            "signed_log1p_transition_rms",
+            "signed_log1p_face_event_rms",
+            "signed_log1p_face_transition_rms",
         }
         if output_mode not in allowed_output_modes:
             raise ValueError(
@@ -229,22 +241,81 @@ class HecRasEdgeFluxHead(nn.Module):
         output = self.net(head_input).reshape(-1) * self.scale
         if self.output_mode == "raw":
             return output
-        if not hasattr(graph, "hecras_internal_face_flow_rms"):
-            raise AttributeError(
-                f"HecRasEdgeFluxHead(output_mode={self.output_mode!r}) requires "
-                "graph.hecras_internal_face_flow_rms."
-            )
-        face_scale = torch.clamp(
-            graph.hecras_internal_face_flow_rms.to(graph.x.device).reshape(-1),
-            min=1.0,
-        ).to(output.dtype)
-        if self.output_mode == "per_face_rms":
+        face_scale = self._resolve_output_scale(graph, output)
+        if not (
+            self.output_mode.startswith("asinh_")
+            or self.output_mode.startswith("signed_log1p_")
+        ):
             return output * face_scale
-        if self.output_mode == "asinh_per_face_rms":
+        if self.output_mode.startswith("asinh_"):
             return torch.sinh(torch.clamp(output, min=-20.0, max=20.0)) * face_scale
-        if self.output_mode == "signed_log1p_per_face_rms":
+        if self.output_mode.startswith("signed_log1p_"):
             return torch.sign(output) * torch.expm1(torch.abs(output)) * face_scale
         raise RuntimeError(f"Unhandled output_mode: {self.output_mode!r}")
+
+    def _resolve_output_scale(self, graph, output: torch.Tensor) -> torch.Tensor:
+        mode = self.output_mode
+        for prefix in ("asinh_", "signed_log1p_"):
+            if mode.startswith(prefix):
+                mode = mode[len(prefix) :]
+                break
+        device = graph.x.device
+        dtype = output.dtype
+        face_scale = None
+        if mode in {"per_face_rms", "face_event_rms", "face_transition_rms"}:
+            if not hasattr(graph, "hecras_internal_face_flow_rms"):
+                raise AttributeError(
+                    f"HecRasEdgeFluxHead(output_mode={self.output_mode!r}) requires "
+                    "graph.hecras_internal_face_flow_rms."
+                )
+            face_scale = torch.clamp(
+                graph.hecras_internal_face_flow_rms.to(device).reshape(-1),
+                min=1.0,
+            ).to(dtype)
+        if mode == "per_face_rms":
+            return face_scale
+        if mode in {"event_rms", "face_event_rms"}:
+            if not hasattr(graph, "hecras_internal_face_flow_event_rms"):
+                raise AttributeError(
+                    f"HecRasEdgeFluxHead(output_mode={self.output_mode!r}) requires "
+                    "graph.hecras_internal_face_flow_event_rms."
+                )
+            event_scale = torch.clamp(
+                graph.hecras_internal_face_flow_event_rms.to(device).reshape(-1)[0],
+                min=1.0,
+            ).to(dtype)
+            if mode == "event_rms":
+                return torch.ones_like(output) * event_scale
+            global_scale = self._global_face_flow_scale(graph, output)
+            return face_scale * event_scale / global_scale
+        if mode in {"transition_rms", "face_transition_rms"}:
+            if not hasattr(graph, "hecras_internal_face_flow_transition_rms"):
+                raise AttributeError(
+                    f"HecRasEdgeFluxHead(output_mode={self.output_mode!r}) requires "
+                    "graph.hecras_internal_face_flow_transition_rms."
+                )
+            transition_scale = torch.clamp(
+                graph.hecras_internal_face_flow_transition_rms.to(device).reshape(-1)[
+                    0
+                ],
+                min=1.0,
+            ).to(dtype)
+            if mode == "transition_rms":
+                return torch.ones_like(output) * transition_scale
+            global_scale = self._global_face_flow_scale(graph, output)
+            return face_scale * transition_scale / global_scale
+        raise RuntimeError(f"Unhandled output scale mode: {self.output_mode!r}")
+
+    def _global_face_flow_scale(self, graph, output: torch.Tensor) -> torch.Tensor:
+        if not hasattr(graph, "hecras_internal_face_flow_global_rms"):
+            raise AttributeError(
+                f"HecRasEdgeFluxHead(output_mode={self.output_mode!r}) requires "
+                "graph.hecras_internal_face_flow_global_rms."
+            )
+        return torch.clamp(
+            graph.hecras_internal_face_flow_global_rms.to(graph.x.device).reshape(-1)[0],
+            min=1.0,
+        ).to(output.dtype)
 
 
 class MGNTrainer:
@@ -311,6 +382,12 @@ class MGNTrainer:
         )
         self.hecras_edge_flux_head_zone_mode = cfg.get(
             "hecras_edge_flux_head_zone_mode", "zone_weight"
+        )
+        self.hecras_edge_flux_head_zone_high_weight = cfg.get(
+            "hecras_edge_flux_head_zone_high_weight", 1.0
+        )
+        self.hecras_edge_flux_head_zone_low_weight = cfg.get(
+            "hecras_edge_flux_head_zone_low_weight", 1.0
         )
         self.hecras_edge_flux_head_closure_target_weight = cfg.get(
             "hecras_edge_flux_head_closure_target_weight", 1.0
@@ -430,6 +507,9 @@ class MGNTrainer:
             hecras_edge_flow_face_stats_npz=cfg.get(
                 "hecras_edge_flow_face_stats_npz"
             ),
+            hecras_edge_flow_scale_stats_npz=cfg.get(
+                "hecras_edge_flow_scale_stats_npz"
+            ),
         )
         sampler = DistributedSampler(
             dataset,
@@ -516,9 +596,29 @@ class MGNTrainer:
         if self.edge_flux_head is not None:
             self.edge_flux_head.train()
         self.criterion = nn.MSELoss()
-        model_parameters = list(self.model.parameters())
+        self.freeze_mesh_model_for_edge_flux_head = bool(
+            cfg.get("freeze_mesh_model_for_edge_flux_head", False)
+        )
+        if self.freeze_mesh_model_for_edge_flux_head and self.edge_flux_head is None:
+            raise ValueError(
+                "freeze_mesh_model_for_edge_flux_head requires "
+                "use_hecras_edge_flux_head=true"
+            )
+        if self.freeze_mesh_model_for_edge_flux_head:
+            rank_zero_logger.info(
+                "Freezing MeshGraphKAN; optimizer will update only "
+                "HecRasEdgeFluxHead."
+            )
+            self.model.eval()
+            for parameter in self.model.parameters():
+                parameter.requires_grad_(False)
+            model_parameters = []
+        else:
+            model_parameters = list(self.model.parameters())
         if self.edge_flux_head is not None:
             model_parameters += list(self.edge_flux_head.parameters())
+        if not model_parameters:
+            raise ValueError("No trainable parameters were selected for optimizer.")
         try:
             if cfg.use_apex:
                 from apex.optimizers import FusedAdam
@@ -691,6 +791,12 @@ class MGNTrainer:
                         edge_flux_delta,
                         graph,
                         zone_mode=self.hecras_edge_flux_head_zone_mode,
+                        zone_high_weight=(
+                            self.hecras_edge_flux_head_zone_high_weight
+                        ),
+                        zone_low_weight=(
+                            self.hecras_edge_flux_head_zone_low_weight
+                        ),
                         closure_target_weight=(
                             self.hecras_edge_flux_head_closure_target_weight
                         ),
@@ -806,6 +912,12 @@ class MGNTrainer:
                         edge_flux_delta,
                         graph,
                         zone_mode=self.hecras_edge_flux_head_zone_mode,
+                        zone_high_weight=(
+                            self.hecras_edge_flux_head_zone_high_weight
+                        ),
+                        zone_low_weight=(
+                            self.hecras_edge_flux_head_zone_low_weight
+                        ),
                         closure_target_weight=(
                             self.hecras_edge_flux_head_closure_target_weight
                         ),

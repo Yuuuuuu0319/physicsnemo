@@ -1,0 +1,4 @@
+experiment,rollout_rmse,projected_projection_closure_relative_rmse,zone_3_projected_projection_closure_relative_rmse,zone_0_projected_projection_closure_relative_rmse,zone_1_projected_projection_closure_relative_rmse,zone_2_projected_projection_closure_relative_rmse,projection_correction_rms_ft3
+previous_best_pretrained_h100_l1,0.08516080294,0.124980064,0.05195316457,0.2838557499,0.06991272611,3.980873066,17562.67244
+h1h24_freeze_manual_balanced_l1p25,0.08564753014,0.1363587421,0.04912226032,0.3165258857,0.07413388173,3.494313,12258.92091
+h1h20_val_selected_l1p25_test,0.08537283121,0.1365706846,0.04878168681,0.317481981,0.07395395271,3.484163116,12237.44862

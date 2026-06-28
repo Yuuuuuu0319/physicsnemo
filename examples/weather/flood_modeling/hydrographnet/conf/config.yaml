@@ -109,6 +109,7 @@ hecras_edge_flow_loss_weight: 0.0
 hecras_edge_flow_zone_mode: zone_weight  # zone_weight, high, high_interior, or all
 hecras_edge_flow_npz: null
 hecras_edge_flow_face_stats_npz: null
+hecras_edge_flow_scale_stats_npz: null
 hecras_edge_flow_mode: all_touching  # all_touching or internal_plus_boundary_source
 
 # Experimental model-side internal edge-flux branch. Unlike
@@ -117,7 +118,9 @@ hecras_edge_flow_mode: all_touching  # all_touching or internal_plus_boundary_so
 # node-volume prediction with explicit boundary/source terms.
 use_hecras_edge_flux_head: false
 hecras_edge_flux_head_loss_weight: 0.0
-hecras_edge_flux_head_zone_mode: zone_weight  # zone_weight, high, high_interior, or all
+hecras_edge_flux_head_zone_mode: zone_weight  # zone_weight, zone_weighted, high, high_interior, or all
+hecras_edge_flux_head_zone_high_weight: 1.0
+hecras_edge_flux_head_zone_low_weight: 1.0
 hecras_edge_flux_head_closure_target_weight: 1.0
 hecras_edge_flux_head_divergence_target_weight: 1.0
 hecras_edge_flux_head_face_target_weight: 0.0
@@ -130,7 +133,8 @@ hecras_edge_flux_head_use_surface_features: false
 hecras_edge_flux_head_use_physical_surface_features: false
 hecras_edge_flux_head_use_previous_face_flow: false
 hecras_edge_flux_head_use_edge_physical_features: false
-hecras_edge_flux_head_output_mode: raw  # raw, per_face_rms, asinh_per_face_rms, or signed_log1p_per_face_rms
+hecras_edge_flux_head_output_mode: raw  # raw, per_face_rms, transition_rms, face_transition_rms, asinh_*, or signed_log1p_*
+freeze_mesh_model_for_edge_flux_head: false
 
 # Performance and optimization configurations.
 use_apex: True            # Use NVIDIA Apex for mixed precision if available.

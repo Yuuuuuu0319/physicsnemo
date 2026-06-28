@@ -348,6 +348,7 @@ class HydroGraphDataset(Dataset):
         hecras_edge_flow_npz: Optional[Union[str, Path]] = None,
         hecras_edge_flow_mode: str = "all_touching",
         hecras_edge_flow_face_stats_npz: Optional[Union[str, Path]] = None,
+        hecras_edge_flow_scale_stats_npz: Optional[Union[str, Path]] = None,
         norm_stats_dir: Optional[Union[str, Path]] = None,
     ):
         if split not in {"train", "test"}:
@@ -400,6 +401,11 @@ class HydroGraphDataset(Dataset):
             if hecras_edge_flow_face_stats_npz is not None
             else None
         )
+        self.hecras_edge_flow_scale_stats_npz = (
+            str(hecras_edge_flow_scale_stats_npz)
+            if hecras_edge_flow_scale_stats_npz is not None
+            else None
+        )
         self.norm_stats_dir = str(norm_stats_dir) if norm_stats_dir is not None else None
 
         # Placeholders for static and dynamic data, indices, and normalization stats.
@@ -418,6 +424,7 @@ class HydroGraphDataset(Dataset):
         self.hecras_cell_balance_delta_by_hydrograph = {}
         self.hecras_edge_flow_delta_by_hydrograph = {}
         self.hecras_edge_flow_face_stats = None
+        self.hecras_edge_flow_scale_stats = None
         self.hecras_boundary_node_mask = None
 
         self.process()
@@ -622,6 +629,7 @@ class HydroGraphDataset(Dataset):
                 self.load_hecras_edge_flow_delta_by_hydrograph()
             )
             self.hecras_edge_flow_face_stats = self.load_hecras_edge_flow_face_stats()
+            self.hecras_edge_flow_scale_stats = self.load_hecras_edge_flow_scale_stats()
             self.hecras_boundary_node_mask = self.load_hecras_boundary_node_mask()
 
         # Build sample indices for training (sliding window) or validate test data.
@@ -1510,6 +1518,42 @@ class HydroGraphDataset(Dataset):
                     )
         return stats
 
+    def load_hecras_edge_flow_scale_stats(self) -> Optional[dict[str, np.ndarray]]:
+        """Load event and transition scale statistics for Face Flow targets."""
+        if self.hecras_edge_flow_scale_stats_npz is None:
+            return None
+        path = Path(self.hecras_edge_flow_scale_stats_npz)
+        if not path.exists():
+            raise FileNotFoundError(path)
+        data = np.load(path)
+        required = ("event_ids", "event_rms", "global_rms")
+        missing = [key for key in required if key not in data.files]
+        if missing:
+            raise KeyError(
+                f"Missing arrays {missing} in HEC-RAS edge-flow scale stats {path}."
+            )
+        event_ids = [str(value) for value in data["event_ids"].tolist()]
+        event_rms = np.asarray(data["event_rms"], dtype=np.float32).reshape(-1)
+        if len(event_ids) != event_rms.shape[0]:
+            raise ValueError(
+                f"event_ids has {len(event_ids)} entries, but event_rms has "
+                f"{event_rms.shape[0]} entries in {path}."
+            )
+        transition_rms = {}
+        for hydrograph_id in event_ids:
+            key = f"{hydrograph_id}_transition_rms"
+            if key not in data.files:
+                raise KeyError(f"Missing transition scale array {key!r} in {path}.")
+            transition_rms[hydrograph_id] = np.asarray(
+                data[key], dtype=np.float32
+            ).reshape(-1)
+        return {
+            "event_ids": np.asarray(event_ids),
+            "event_rms_by_id": dict(zip(event_ids, event_rms)),
+            "transition_rms_by_id": transition_rms,
+            "global_rms": np.asarray(data["global_rms"], dtype=np.float32).reshape(-1),
+        }
+
     def add_hecras_edge_flow_attrs(
         self, graph, transition_index: int, hydrograph_id: str
     ) -> None:
@@ -1566,6 +1610,41 @@ class HydroGraphDataset(Dataset):
                     graph.hecras_internal_face_flow_rms = torch.tensor(
                         self.hecras_edge_flow_face_stats["face_rms"],
                         dtype=torch.float,
+                    )
+                if self.hecras_edge_flow_scale_stats is not None:
+                    event_rms = self.hecras_edge_flow_scale_stats[
+                        "event_rms_by_id"
+                    ].get(hydrograph_id)
+                    transition_rms_array = self.hecras_edge_flow_scale_stats[
+                        "transition_rms_by_id"
+                    ].get(hydrograph_id)
+                    if event_rms is None or transition_rms_array is None:
+                        available = ", ".join(
+                            sorted(
+                                self.hecras_edge_flow_scale_stats[
+                                    "transition_rms_by_id"
+                                ]
+                            )
+                        )
+                        raise KeyError(
+                            f"No Face Flow scale stats for {hydrograph_id}. "
+                            f"Available hydrographs: {available}"
+                        )
+                    if transition_index >= transition_rms_array.shape[0]:
+                        raise IndexError(
+                            f"Transition {transition_index} is outside scale stats "
+                            f"0..{transition_rms_array.shape[0] - 1} for "
+                            f"{hydrograph_id}."
+                        )
+                    graph.hecras_internal_face_flow_global_rms = torch.tensor(
+                        self.hecras_edge_flow_scale_stats["global_rms"],
+                        dtype=torch.float,
+                    )
+                    graph.hecras_internal_face_flow_event_rms = torch.tensor(
+                        [event_rms], dtype=torch.float
+                    )
+                    graph.hecras_internal_face_flow_transition_rms = torch.tensor(
+                        [transition_rms_array[transition_index]], dtype=torch.float
                     )
         else:
             graph.hecras_edge_flow_delta = torch.tensor(

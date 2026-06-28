@@ -105,6 +105,8 @@ def evaluate_checkpoint(
                 edge_flux_delta,
                 graph,
                 zone_mode=args.zone_mode,
+                zone_high_weight=args.zone_high_weight,
+                zone_low_weight=args.zone_low_weight,
                 closure_target_weight=args.closure_target_weight,
                 divergence_target_weight=args.divergence_target_weight,
                 face_target_weight=args.face_target_weight,
@@ -160,6 +162,7 @@ def build_dataset(args: argparse.Namespace) -> HydroGraphDataset:
         hecras_edge_flow_npz=args.hecras_edge_flow_npz,
         hecras_edge_flow_mode="internal_plus_boundary_source",
         hecras_edge_flow_face_stats_npz=args.hecras_edge_flow_face_stats_npz,
+        hecras_edge_flow_scale_stats_npz=args.hecras_edge_flow_scale_stats_npz,
     )
 
 
@@ -187,7 +190,10 @@ def main() -> None:
     parser.add_argument("--hecras-face-graph-file", required=True)
     parser.add_argument("--hecras-edge-flow-npz", required=True)
     parser.add_argument("--hecras-edge-flow-face-stats-npz")
+    parser.add_argument("--hecras-edge-flow-scale-stats-npz")
     parser.add_argument("--zone-mode", default="high")
+    parser.add_argument("--zone-high-weight", type=float, default=1.0)
+    parser.add_argument("--zone-low-weight", type=float, default=1.0)
     parser.add_argument("--closure-target-weight", type=float, default=1.0)
     parser.add_argument("--divergence-target-weight", type=float, default=1.0)
     parser.add_argument("--face-target-weight", type=float, default=0.0)
@@ -202,6 +208,18 @@ def main() -> None:
             "per_face_rms",
             "asinh_per_face_rms",
             "signed_log1p_per_face_rms",
+            "event_rms",
+            "asinh_event_rms",
+            "signed_log1p_event_rms",
+            "transition_rms",
+            "asinh_transition_rms",
+            "signed_log1p_transition_rms",
+            "face_event_rms",
+            "asinh_face_event_rms",
+            "signed_log1p_face_event_rms",
+            "face_transition_rms",
+            "asinh_face_transition_rms",
+            "signed_log1p_face_transition_rms",
         ),
     )
     parser.add_argument("--output-csv", required=True, type=Path)
