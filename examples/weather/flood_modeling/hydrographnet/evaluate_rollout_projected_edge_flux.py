@@ -105,6 +105,29 @@ def rollout_boundary_source_delta(dataset, hydrograph_id: str, transition_index:
     return torch.tensor(edge_flow["boundary"][transition_index], dtype=torch.float)
 
 
+def feedback_node_mask(graph, args) -> torch.Tensor:
+    """Return nodes where projected volume is fed back into rollout state."""
+
+    mode = args.feedback_mode
+    device = args.device_obj
+    if mode == "selected":
+        return selected_node_mask(graph, args.projection_mode, device)
+    if mode == "all":
+        return torch.ones(graph.x.shape[0], dtype=torch.bool, device=device)
+
+    if not hasattr(graph, "zone_label"):
+        raise AttributeError(f"feedback_mode={mode!r} requires graph.zone_label")
+    zone_label = graph.zone_label.to(device)
+    if mode == "high":
+        return zone_label == 3
+    if mode == "high_interior":
+        mask = zone_label == 3
+        if hasattr(graph, "hecras_boundary_node_mask"):
+            mask = mask & (~graph.hecras_boundary_node_mask.to(device))
+        return mask
+    raise ValueError(f"Unknown feedback mode: {mode!r}")
+
+
 def evaluate_rollout(model, edge_head, dataset, args) -> list[dict[str, float | str | int]]:
     rows = []
     model.eval()
@@ -189,11 +212,9 @@ def evaluate_rollout(model, edge_head, dataset, args) -> list[dict[str, float | 
                     + args.projected_volume_alpha
                     * (projected_new_volume - original_new_volume)
                 )
-                feedback_node_mask = selected_node_mask(
-                    graph, args.projection_mode, args.device_obj
-                )
+                feedback_mask = feedback_node_mask(graph, args)
                 blended_projected_new_volume = torch.where(
-                    feedback_node_mask,
+                    feedback_mask,
                     blended_projected_new_volume,
                     original_new_volume,
                 )
@@ -332,6 +353,7 @@ def evaluate_rollout(model, edge_head, dataset, args) -> list[dict[str, float | 
             row["projection_ridge"] = args.projection_ridge
             row["state_update"] = args.state_update
             row["projected_volume_alpha"] = args.projected_volume_alpha
+            row["feedback_mode"] = args.feedback_mode
             row["projection_high_weight"] = args.projection_high_weight
             row["projection_low_weight"] = args.projection_low_weight
             row["projection_solver"] = args.projection_solver
@@ -353,6 +375,7 @@ def average_rows(rows: list[dict[str, float | str | int]]) -> dict[str, float | 
         "projection_ridge": rows[0]["projection_ridge"],
         "state_update": rows[0]["state_update"],
         "projected_volume_alpha": rows[0]["projected_volume_alpha"],
+        "feedback_mode": rows[0]["feedback_mode"],
         "projection_high_weight": rows[0]["projection_high_weight"],
         "projection_low_weight": rows[0]["projection_low_weight"],
         "projection_solver": rows[0]["projection_solver"],
@@ -449,6 +472,16 @@ def main() -> None:
             "(projected - original)."
         ),
     )
+    parser.add_argument(
+        "--feedback-mode",
+        default="selected",
+        choices=("selected", "all", "high", "high_interior"),
+        help=(
+            "Nodes whose rollout volume state receives the projected-volume "
+            "feedback. 'selected' preserves the historical behavior and uses "
+            "the projection-mode mask."
+        ),
+    )
     parser.add_argument("--cg-rtol", type=float, default=1e-8)
     parser.add_argument("--cg-maxiter", type=int, default=2000)
     parser.add_argument("--device", default="cuda")
@@ -507,6 +540,7 @@ def main() -> None:
         "projection_ridge",
         "state_update",
         "projected_volume_alpha",
+        "feedback_mode",
         "projection_high_weight",
         "projection_low_weight",
         "projection_solver",
