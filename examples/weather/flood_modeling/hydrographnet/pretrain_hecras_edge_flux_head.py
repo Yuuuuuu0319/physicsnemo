@@ -10,8 +10,10 @@ magnitude here, coupling it to HydroGraphNet will not fix the core issue.
 
 import argparse
 import csv
+import random
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch_geometric.loader import DataLoader as PyGDataLoader
 
@@ -383,10 +385,19 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--max-train-batches", type=int)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--init-ckpt-path", type=Path)
+    parser.add_argument("--init-ckpt-epoch", type=int)
     parser.add_argument("--ckpt-path", required=True, type=Path)
     parser.add_argument("--output-csv", required=True, type=Path)
     args = parser.parse_args()
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
     args.device_obj = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     train_dataset = build_dataset(args, args.train_ids_file, args.num_train_samples)
@@ -403,6 +414,18 @@ def main() -> None:
         use_edge_physical_features=args.edge_head_use_edge_physical_features,
         output_mode=args.edge_head_output_mode,
     ).to(args.device_obj)
+    loaded_init_epoch = None
+    if args.init_ckpt_path is not None:
+        loaded_init_epoch = load_checkpoint(
+            args.init_ckpt_path,
+            models=[edge_head],
+            epoch=args.init_ckpt_epoch,
+            device=args.device_obj,
+        )
+        print(
+            f"Initialized edge head from {args.init_ckpt_path} "
+            f"epoch {loaded_init_epoch}."
+        )
     optimizer = torch.optim.AdamW(
         edge_head.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -412,6 +435,11 @@ def main() -> None:
         optimizer=optimizer,
         device=args.device_obj,
     )
+    if start_epoch > 0 and loaded_init_epoch is not None:
+        print(
+            f"Resuming {args.ckpt_path} from epoch {start_epoch}; "
+            "the resume checkpoint overrides the initialization checkpoint."
+        )
     rows = []
     eval_dataset = None
     original_edge_npz = args.hecras_edge_flow_npz

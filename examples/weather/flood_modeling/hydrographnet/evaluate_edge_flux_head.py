@@ -60,7 +60,7 @@ def add_residual_metrics(
 
 
 def evaluate_checkpoint(
-    model: MeshGraphKAN,
+    model: MeshGraphKAN | None,
     edge_head: HecRasEdgeFluxHead,
     dataset: HydroGraphDataset,
     args: argparse.Namespace,
@@ -70,25 +70,26 @@ def evaluate_checkpoint(
     with torch.no_grad():
         for graph in dataset:
             graph = graph.to(args.device_obj)
-            pred = model(graph.x, graph.edge_attr, graph)
+            pred = model(graph.x, graph.edge_attr, graph) if model is not None else None
             edge_flux_delta = edge_head(graph)
             divergence = compute_divergence(graph, edge_flux_delta)
 
-            volume_std = graph.volume_std.reshape(-1)[0].to(args.device_obj)
-            pred_delta = pred[:, 1] * volume_std
             internal_target = graph.hecras_edge_internal_delta.to(args.device_obj).reshape(-1)
             boundary_target = graph.hecras_edge_boundary_source_delta.to(args.device_obj).reshape(-1)
-            total_target = internal_target + boundary_target
 
             divergence_residual = divergence - internal_target
-            closure_residual = pred_delta - boundary_target - divergence
-            total_residual = pred_delta - total_target
 
             add_residual_metrics(
                 sums, "divergence", divergence_residual, internal_target
             )
-            add_residual_metrics(sums, "closure", closure_residual, pred_delta)
-            add_residual_metrics(sums, "total_node", total_residual, total_target)
+            if pred is not None:
+                volume_std = graph.volume_std.reshape(-1)[0].to(args.device_obj)
+                pred_delta = pred[:, 1] * volume_std
+                total_target = internal_target + boundary_target
+                closure_residual = pred_delta - boundary_target - divergence
+                total_residual = pred_delta - total_target
+                add_residual_metrics(sums, "closure", closure_residual, pred_delta)
+                add_residual_metrics(sums, "total_node", total_residual, total_target)
             add_value(sums, "edge_flux_rms_ft3", rmse(edge_flux_delta))
             add_value(sums, "edge_flux_mae_ft3", mae(edge_flux_delta))
             if hasattr(graph, "hecras_internal_face_flow_delta"):
@@ -100,21 +101,22 @@ def evaluate_checkpoint(
                     sums, "internal_face", face_residual, face_target
                 )
 
-            loss, loss_metrics = compute_hecras_edge_flux_head_loss(
-                pred,
-                edge_flux_delta,
-                graph,
-                zone_mode=args.zone_mode,
-                zone_high_weight=args.zone_high_weight,
-                zone_low_weight=args.zone_low_weight,
-                closure_target_weight=args.closure_target_weight,
-                divergence_target_weight=args.divergence_target_weight,
-                face_target_weight=args.face_target_weight,
-                face_loss_normalization=args.face_loss_normalization,
-            )
-            add_value(sums, "selected_edge_flux_head_loss", loss)
-            for key, value in loss_metrics.items():
-                add_value(sums, f"selected_{key}", value)
+            if pred is not None:
+                loss, loss_metrics = compute_hecras_edge_flux_head_loss(
+                    pred,
+                    edge_flux_delta,
+                    graph,
+                    zone_mode=args.zone_mode,
+                    zone_high_weight=args.zone_high_weight,
+                    zone_low_weight=args.zone_low_weight,
+                    closure_target_weight=args.closure_target_weight,
+                    divergence_target_weight=args.divergence_target_weight,
+                    face_target_weight=args.face_target_weight,
+                    face_loss_normalization=args.face_loss_normalization,
+                )
+                add_value(sums, "selected_edge_flux_head_loss", loss)
+                for key, value in loss_metrics.items():
+                    add_value(sums, f"selected_{key}", value)
 
             if hasattr(graph, "zone_label"):
                 zone_label = graph.zone_label.to(args.device_obj)
@@ -127,18 +129,19 @@ def evaluate_checkpoint(
                             divergence_residual[mask],
                             internal_target[mask],
                         )
-                        add_residual_metrics(
-                            sums,
-                            f"zone_{zone}_closure",
-                            closure_residual[mask],
-                            pred_delta[mask],
-                        )
-                        add_residual_metrics(
-                            sums,
-                            f"zone_{zone}_total_node",
-                            total_residual[mask],
-                            total_target[mask],
-                        )
+                        if pred is not None:
+                            add_residual_metrics(
+                                sums,
+                                f"zone_{zone}_closure",
+                                closure_residual[mask],
+                                pred_delta[mask],
+                            )
+                            add_residual_metrics(
+                                sums,
+                                f"zone_{zone}_total_node",
+                                total_residual[mask],
+                                total_target[mask],
+                            )
             count += 1
 
     return {key: value / max(count, 1) for key, value in sums.items()}
@@ -178,6 +181,8 @@ def main() -> None:
     parser.add_argument("--num-input-features", type=int, default=16)
     parser.add_argument("--num-edge-features", type=int, default=3)
     parser.add_argument("--num-output-features", type=int, default=2)
+    parser.add_argument("--node-checkpoint-path", type=Path)
+    parser.add_argument("--node-checkpoint-epoch", type=int)
     parser.add_argument("--edge-head-hidden-dim", type=int, default=128)
     parser.add_argument("--edge-head-num-hidden-layers", type=int, default=2)
     parser.add_argument("--edge-head-use-face-normal", action="store_true")
@@ -239,11 +244,20 @@ def main() -> None:
     for name, checkpoint_path_raw, epoch_raw, scale_raw in args.checkpoint:
         epoch = int(epoch_raw)
         scale = float(scale_raw)
-        model = MeshGraphKAN(
-            args.num_input_features,
-            args.num_edge_features,
-            args.num_output_features,
-        ).to(args.device_obj)
+        model = None
+        loaded_node_epoch = None
+        if args.node_checkpoint_path is not None:
+            model = MeshGraphKAN(
+                args.num_input_features,
+                args.num_edge_features,
+                args.num_output_features,
+            ).to(args.device_obj)
+            loaded_node_epoch = load_checkpoint(
+                args.node_checkpoint_path,
+                models=[model],
+                epoch=args.node_checkpoint_epoch,
+                device=args.device_obj,
+            )
         edge_head = HecRasEdgeFluxHead(
             args.num_input_features,
             hidden_dim=args.edge_head_hidden_dim,
@@ -260,18 +274,21 @@ def main() -> None:
             ),
             output_mode=args.edge_head_output_mode,
         ).to(args.device_obj)
-        loaded_epoch = load_checkpoint(
+        loaded_edge_epoch = load_checkpoint(
             Path(checkpoint_path_raw),
-            models=[model, edge_head],
+            models=[edge_head],
             epoch=epoch,
             device=args.device_obj,
         )
-        model.eval()
+        if model is not None:
+            model.eval()
         edge_head.eval()
         row = {
             "checkpoint": name,
             "requested_epoch": epoch,
-            "loaded_epoch": loaded_epoch,
+            "loaded_epoch": loaded_edge_epoch,
+            "loaded_edge_epoch": loaded_edge_epoch,
+            "loaded_node_epoch": loaded_node_epoch,
             "edge_head_scale": scale,
             "num_samples": len(dataset),
             "zone_mode": args.zone_mode,
@@ -281,7 +298,7 @@ def main() -> None:
         rows.append(row)
         print(
             f"{name} epoch {epoch}: "
-            f"closure_rmse={row['closure_rmse_ft3']:.3f}, "
+            f"closure_rmse={row.get('closure_rmse_ft3', float('nan')):.3f}, "
             f"divergence_rmse={row['divergence_rmse_ft3']:.3f}, "
             f"zone3_closure_rmse={row.get('zone_3_closure_rmse_ft3', float('nan')):.3f}, "
             f"zone3_divergence_rmse={row.get('zone_3_divergence_rmse_ft3', float('nan')):.3f}"
