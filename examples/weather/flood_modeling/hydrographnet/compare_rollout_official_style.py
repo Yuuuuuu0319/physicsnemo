@@ -173,6 +173,7 @@ def main():
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--test-ids-file", default="test_h13h15.txt")
     parser.add_argument("--ckpt-path", required=True)
+    parser.add_argument("--ckpt-epoch", type=int)
     parser.add_argument("--rollout-length", type=int, default=25)
     parser.add_argument("--output-csv", required=True)
     parser.add_argument("--animation-dir")
@@ -206,6 +207,7 @@ def main():
         scheduler=None,
         scaler=None,
         device=device,
+        epoch=args.ckpt_epoch,
     )
     model.eval()
 
