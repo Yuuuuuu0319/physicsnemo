@@ -45,11 +45,22 @@ num_edge_features: 3      # Number of edge features.
 # Noise settings.
 noise_type: "none"        # Options: "none", "pushforward", "only_last", "correlated", etc.
 n_time_steps: 2           # Number of time steps in the sliding window.
+# Optional sample-count overrides. When null, validated datasets can provide
+# these values through hgn_dataset_validation.json; legacy data keeps 72/25.
+dynamic_skip_steps: null
+post_peak_steps: null
 
 # Physics loss settings.
 use_physics_loss: true
 delta_t: 1200.0
 physics_loss_weight: 1.0
+# Raw M80_Pr is mm/h. Official SI data uses mm/h -> m/s (2.7778e-7).
+# Minxiong US-customary runs must override this with 9.113444e-7 (ft/s).
+precipitation_unit_conversion: 2.7778e-7
+# Official behavior multiplies rain by M80_IP. Minxiong HDF diagnostics show
+# spatially uniform cumulative precipitation, so formal runs use full_area.
+local_source_runoff_mode: ip_fraction  # ip_fraction or full_area
+require_node_precipitation: false
 
 # Fidelity-zone configuration. This is intentionally separate from any future
 # edge-informed local-conservation work.
@@ -86,14 +97,21 @@ hecras_face_geometry_zone_mode: zone_weight  # zone_weight, high/high_adjacent, 
 hecras_face_geometry_wet_depth_threshold: null  # physical water depth threshold; null disables wet/dry masking
 hecras_face_geometry_reference_mode: smooth  # smooth, target_gradient, source_smooth, or source_target_gradient
 
-# Formal HEC-RAS cell-balance branch. This uses native Cell Flow Balance
-# integrated over the matching HGN interval plus native precipitation volume.
-# It is separate from the calibrated face-velocity proxy and should be used
-# only with synchronized event HDFs and area-extrapolated HGN volume targets.
+# Formal HEC-RAS cell-budget branch. Five-minute formal targets must come from
+# interval-resolved Face Flow Period Average plus known raster precipitation,
+# collapsed to cells without exposing edge values to the model. Directly
+# integrating point-sampled five-minute Cell Flow Balance is not allowed.
 use_hecras_cell_balance_loss: false
 hecras_cell_balance_loss_weight: 0.0
 hecras_cell_balance_zone_mode: zone_weight  # zone_weight, high, or all
+hecras_cell_balance_loss_normalization: none  # none, volume_std, or target_rms
 hecras_cell_balance_glob: null
+hecras_cell_balance_npz: null
+hecras_cell_balance_target_dir: null
+hecras_cell_balance_npz_key_suffix: "_cell_balance_storage_delta"
+# Null uses the validated warm-up skip for sharded five-minute targets and 0
+# for legacy NPZ/HDF targets that are already trimmed to model time.
+hecras_cell_balance_time_offset: null
 hecras_cell_balance_path: "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/2D Flow Areas/per2/Cell Flow Balance"
 hecras_precipitation_path: "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/2D Flow Areas/per2/Cell Cumulative Precipitation Depth"
 hecras_result_time_path: "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Time"
@@ -108,9 +126,13 @@ use_hecras_edge_flow_loss: false
 hecras_edge_flow_loss_weight: 0.0
 hecras_edge_flow_zone_mode: zone_weight  # zone_weight, high, high_interior, or all
 hecras_edge_flow_npz: null
+hecras_conservative_edge_target_dir: null
 hecras_edge_flow_face_stats_npz: null
 hecras_edge_flow_scale_stats_npz: null
-hecras_edge_flow_mode: all_touching  # all_touching or internal_plus_boundary_source
+hecras_edge_flow_mode: all_touching  # all_touching, internal_plus_boundary_source, or conservative_sharded
+# Null automatically uses the dataset time contract's warm-up skip for formal
+# sharded targets; legacy pre-trimmed targets can explicitly use 0.
+hecras_edge_flow_time_offset: null
 
 # Experimental model-side internal edge-flux branch. Unlike
 # use_hecras_edge_flow_loss, this adds a small edge head that predicts signed
@@ -124,7 +146,11 @@ hecras_edge_flux_head_zone_low_weight: 1.0
 hecras_edge_flux_head_closure_target_weight: 1.0
 hecras_edge_flux_head_divergence_target_weight: 1.0
 hecras_edge_flux_head_face_target_weight: 0.0
+hecras_edge_flux_head_face_zone_mode: all  # direct Face Flow supervision scope, independent of local closure scope
 hecras_edge_flux_head_face_loss_normalization: none  # none, target_rms, asinh_target_rms, signed_log1p_target_rms, per_face_rms, asinh_per_face_rms, or signed_log1p_per_face_rms
+hecras_edge_flux_head_node_loss_normalization: none  # none, target_rms, or volume_std
+hecras_edge_flux_head_storage_delta_mode: dataset_volume  # dataset_volume, legacy capped_volume, or area_extrapolated_volume
+hecras_edge_flux_head_closure_granularity: node  # node or connected_control_volume
 hecras_edge_flux_head_hidden_dim: 128
 hecras_edge_flux_head_num_hidden_layers: 2
 hecras_edge_flux_head_scale: 1.0
@@ -133,8 +159,34 @@ hecras_edge_flux_head_use_surface_features: false
 hecras_edge_flux_head_use_physical_surface_features: false
 hecras_edge_flux_head_use_previous_face_flow: false
 hecras_edge_flux_head_use_edge_physical_features: false
+hecras_edge_flux_head_use_node_prediction_features: false
 hecras_edge_flux_head_output_mode: raw  # raw, per_face_rms, transition_rms, face_transition_rms, asinh_*, or signed_log1p_*
+hecras_edge_flux_head_active_face_mode: all  # all, zone4_touch, or high_interior_touch
 freeze_mesh_model_for_edge_flux_head: false
+
+# Differentiable exact conservation for connected high-fidelity interior
+# control volumes. The projection constraint uses only predicted storage and
+# known precipitation, never future HEC-RAS Face Flow or boundary targets.
+# Face Flow remains a training target after projection. Keep disabled for the
+# HydroGraphNet baseline and soft edge-head ablations.
+use_selective_hard_conservation: false
+selective_hard_conservation_loss_weight: 0.0
+selective_hard_conservation_raw_control_volume_weight: 0.0
+selective_hard_conservation_correction_weight_mode: training_face_rms_squared  # or equal
+selective_hard_conservation_face_loss_normalization: asinh_per_face_rms
+selective_hard_conservation_node_loss_normalization: volume_std
+
+# Optional explicit autoregressive training. Values greater than one attach
+# consecutive ground-truth states and forcing to each train sample. The
+# selective_projected mode feeds differentiable edge-divergence volume changes
+# back only to the fixed high-fidelity interior control volumes. Batch size 1
+# and noise_type=none are currently required. Defaults preserve all legacy
+# one-step behavior.
+training_rollout_steps: 1
+training_rollout_discount: 1.0
+training_rollout_backprop_through_time: true
+training_rollout_volume_feedback: node  # node or selective_projected
+training_rollout_projected_volume_alpha: 1.0
 
 # Performance and optimization configurations.
 use_apex: True            # Use NVIDIA Apex for mixed precision if available.
@@ -151,6 +203,10 @@ watch_model: False
 
 # Checkpoint path.
 ckpt_path: "./checkpoints_phy"
+# Optional node-backbone warm start. A checkpoint in ckpt_path, when present,
+# still overrides this initialization during normal resume.
+init_mesh_checkpoint_path: null
+init_mesh_checkpoint_epoch: null
 
 # Test and visualization configuration.
 num_test_samples: 10

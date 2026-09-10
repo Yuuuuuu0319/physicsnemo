@@ -1,0 +1,9 @@
+defaults:
+  - formal_si5m_common
+  - _self_
+
+seed: 0
+ckpt_path: /mnt/8tb_hdd2/joyce/formal_si5m_runs/baseline_seed0
+
+use_hecras_edge_flux_head: false
+use_selective_hard_conservation: false

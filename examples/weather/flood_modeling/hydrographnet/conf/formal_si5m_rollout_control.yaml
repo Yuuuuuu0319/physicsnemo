@@ -1,0 +1,13 @@
+defaults:
+  - formal_si5m_baseline
+  - _self_
+
+# Fair multi-step control: the HGN backbone receives the same four-step
+# autoregressive training exposure as the proposed model, but no edge head or
+# projection. This separates generic rollout-training gains from conservation.
+seed: 0
+ckpt_path: /mnt/8tb_hdd2/joyce/formal_si5m_runs/rollout_control_seed0
+training_rollout_steps: 4
+training_rollout_discount: 1.0
+training_rollout_backprop_through_time: true
+training_rollout_volume_feedback: node

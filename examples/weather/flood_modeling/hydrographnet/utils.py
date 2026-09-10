@@ -269,7 +269,12 @@ def compute_hecras_face_local_loss(
     return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=pred.device)
 
 
-def compute_hecras_cell_balance_loss(pred, graph, zone_mode="zone_weight"):
+def compute_hecras_cell_balance_loss(
+    pred,
+    graph,
+    zone_mode="zone_weight",
+    normalization="none",
+):
     """Compute a formal HEC-RAS local storage-budget loss.
 
     This objective compares the model's denormalized per-cell volume delta to
@@ -293,7 +298,8 @@ def compute_hecras_cell_balance_loss(pred, graph, zone_mode="zone_weight"):
 
         volume_std = graph.volume_std.reshape(-1)[local_idx].to(pred.device)
         pred_delta = pred[node_mask, 1] * volume_std
-        residual = pred_delta - budget_delta[node_mask].to(pred.dtype)
+        local_target = budget_delta[node_mask].to(pred.dtype)
+        residual = pred_delta - local_target
 
         weights = None
         if zone_mode == "zone_weight" and hasattr(graph, "zone_weight"):
@@ -302,6 +308,27 @@ def compute_hecras_cell_balance_loss(pred, graph, zone_mode="zone_weight"):
             weights = (graph.zone_label[node_mask].to(pred.device) == 3).to(pred.dtype)
         elif zone_mode == "all":
             weights = torch.ones_like(residual)
+
+        if normalization == "volume_std":
+            residual = residual / torch.clamp(volume_std.to(pred.dtype), min=1.0)
+        elif normalization == "target_rms":
+            if weights is not None and torch.sum(weights) > 0:
+                target_rms = torch.sqrt(
+                    torch.clamp(
+                        torch.sum(weights * local_target**2) / torch.sum(weights),
+                        min=1.0,
+                    )
+                )
+            else:
+                target_rms = torch.sqrt(
+                    torch.clamp(torch.mean(local_target**2), min=1.0)
+                )
+            residual = residual / target_rms
+        elif normalization != "none":
+            raise ValueError(
+                "normalization must be 'none', 'volume_std', or 'target_rms', "
+                f"got {normalization!r}."
+            )
 
         if weights is not None and torch.sum(weights) > 0:
             losses.append(torch.sum(weights * residual**2) / torch.sum(weights))
@@ -385,6 +412,57 @@ def compute_hecras_edge_flow_loss(pred, graph, zone_mode="zone_weight"):
     return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=pred.device)
 
 
+def compute_area_extrapolated_storage_delta(
+    pred,
+    graph,
+    node_mask=None,
+    batch_index=0,
+    current_surface_elevation=None,
+):
+    """Convert HydroGraphNet outputs to an uncapped physical storage delta.
+
+    HydroGraphNet's volume target follows the finite HEC-RAS volume-elevation
+    table and is capped above the highest tabulated water-surface elevation.
+    The differentiable correction below extrapolates that missing storage with
+    the native HEC-RAS cell surface area and the predicted water-depth change.
+    """
+
+    required_attrs = (
+        "volume_std",
+        "water_depth_std",
+        "current_surface_elevation",
+        "hecras_node_area",
+        "hecras_node_volume_table_top_elevation",
+    )
+    missing = [attr for attr in required_attrs if not hasattr(graph, attr)]
+    if missing:
+        raise AttributeError(
+            "area_extrapolated_volume requires graph attributes: "
+            + ", ".join(missing)
+        )
+    if node_mask is None:
+        node_mask = torch.ones(
+            pred.shape[0], dtype=torch.bool, device=pred.device
+        )
+    volume_std = graph.volume_std.reshape(-1)[batch_index].to(pred.device)
+    water_depth_std = graph.water_depth_std.reshape(-1)[batch_index].to(pred.device)
+    capped_volume_delta = pred[node_mask, 1] * volume_std
+    water_depth_delta = pred[node_mask, 0] * water_depth_std
+    if current_surface_elevation is None:
+        current_surface = graph.current_surface_elevation[node_mask].to(pred.device)
+    else:
+        current_surface = current_surface_elevation.to(pred.device).reshape(-1)
+    table_top = graph.hecras_node_volume_table_top_elevation[node_mask].to(
+        pred.device
+    )
+    node_area = graph.hecras_node_area[node_mask].to(pred.device)
+    current_excess_depth = torch.relu(current_surface - table_top)
+    next_excess_depth = torch.relu(current_surface + water_depth_delta - table_top)
+    return capped_volume_delta + node_area * (
+        next_excess_depth - current_excess_depth
+    )
+
+
 def compute_hecras_edge_flux_head_loss(
     pred,
     edge_flux_delta,
@@ -395,14 +473,25 @@ def compute_hecras_edge_flux_head_loss(
     closure_target_weight=1.0,
     divergence_target_weight=1.0,
     face_target_weight=0.0,
+    face_zone_mode=None,
     face_loss_normalization="none",
+    node_loss_normalization="none",
+    storage_delta_mode="dataset_volume",
+    closure_granularity="node",
+    delta_t=1200.0,
 ):
     """Compute a model-side internal edge-flux local-conservation loss.
 
     ``edge_flux_delta`` is the model-predicted signed interval volume flux on
     the HEC-RAS internal face graph. Its divergence is compared with the native
-    internal Face Flow target, while the node volume prediction is closed with
-    the explicit boundary/source residual.
+    internal Face Flow target. The node-volume closure separately includes the
+    known precipitation source and the external-boundary Face Flow target.
+    ``zone_mode`` controls node divergence/closure selection, while
+    ``face_zone_mode`` independently controls direct Face Flow supervision.
+    Current Minxiong formal data already use area-extrapolated dataset volumes,
+    so ``dataset_volume`` is the formal mode. ``area_extrapolated_volume`` is
+    retained only for legacy datasets whose stored volume was capped at the
+    HEC-RAS volume-elevation table top.
     """
     required_attrs = (
         "hecras_face_index",
@@ -430,6 +519,8 @@ def compute_hecras_edge_flux_head_loss(
     face_losses = []
     raw_face_losses = []
     edge_flux_delta = edge_flux_delta.reshape(-1).to(pred.device)
+    if face_zone_mode is None:
+        face_zone_mode = zone_mode
 
     for local_idx, uid in enumerate(unique_ids):
         if uid is None:
@@ -455,12 +546,35 @@ def compute_hecras_edge_flux_head_loss(
         divergence.index_add_(0, local_dst, local_flux)
 
         volume_std = graph.volume_std.reshape(-1)[local_idx].to(pred.device)
-        pred_delta = pred[node_mask, 1] * volume_std
+        if storage_delta_mode in ("dataset_volume", "capped_volume"):
+            pred_delta = pred[node_mask, 1] * volume_std
+        elif storage_delta_mode == "area_extrapolated_volume":
+            pred_delta = compute_area_extrapolated_storage_delta(
+                pred,
+                graph,
+                node_mask=node_mask,
+                batch_index=local_idx,
+            )
+        else:
+            raise ValueError(
+                "storage_delta_mode must be 'dataset_volume', 'capped_volume', or "
+                f"'area_extrapolated_volume', got {storage_delta_mode!r}."
+            )
         internal_target = internal_delta[node_mask].to(pred.dtype)
         boundary_target = boundary_delta[node_mask].to(pred.dtype)
+        source_delta = torch.zeros_like(pred_delta)
+        if hasattr(graph, "hecras_local_source_delta"):
+            source_delta = graph.hecras_local_source_delta[node_mask].to(
+                pred.device
+            ).to(pred.dtype)
+        elif hasattr(graph, "local_source_rate"):
+            source_delta = (
+                graph.local_source_rate[node_mask].to(pred.device).to(pred.dtype)
+                * float(delta_t)
+            )
 
         divergence_residual = divergence - internal_target
-        closure_residual = pred_delta - boundary_target - divergence
+        closure_residual = pred_delta - source_delta - boundary_target - divergence
 
         weights = None
         if zone_mode == "zone_weight" and hasattr(graph, "zone_weight"):
@@ -491,15 +605,94 @@ def compute_hecras_edge_flux_head_loss(
         elif zone_mode == "all":
             weights = torch.ones_like(divergence_residual)
 
+        if node_loss_normalization == "target_rms":
+            if weights is not None and torch.sum(weights) > 0:
+                target_rms = torch.sqrt(
+                    torch.clamp(
+                        torch.sum(weights * internal_target**2) / torch.sum(weights),
+                        min=1.0,
+                    )
+                )
+            else:
+                target_rms = torch.sqrt(
+                    torch.clamp(torch.mean(internal_target**2), min=1.0)
+                )
+            divergence_residual = divergence_residual / target_rms
+            closure_residual = closure_residual / target_rms
+        elif node_loss_normalization == "volume_std":
+            scale = torch.clamp(volume_std.to(pred.dtype), min=1.0)
+            divergence_residual = divergence_residual / scale
+            closure_residual = closure_residual / scale
+        elif node_loss_normalization != "none":
+            raise ValueError(
+                "node_loss_normalization must be 'none', 'target_rms', or "
+                "'volume_std', got "
+                f"{node_loss_normalization!r}."
+            )
+
         if weights is not None and torch.sum(weights) > 0:
             divergence_losses.append(
                 torch.sum(weights * divergence_residual**2) / torch.sum(weights)
             )
-            closure_losses.append(
-                torch.sum(weights * closure_residual**2) / torch.sum(weights)
-            )
+            if closure_granularity == "node":
+                closure_losses.append(
+                    torch.sum(weights * closure_residual**2) / torch.sum(weights)
+                )
+            elif closure_granularity == "connected_control_volume":
+                if not hasattr(
+                    graph, "hecras_high_interior_control_volume_label"
+                ):
+                    raise AttributeError(
+                        "connected_control_volume closure requires "
+                        "graph.hecras_high_interior_control_volume_label."
+                    )
+                control_volume_label = (
+                    graph.hecras_high_interior_control_volume_label[node_mask]
+                    .to(pred.device)
+                    .reshape(-1)
+                )
+                selected = (weights > 0) & (control_volume_label >= 0)
+                if torch.sum(selected) != torch.sum(weights > 0):
+                    raise ValueError(
+                        "Every node selected for connected-control-volume closure "
+                        "must have a non-negative control-volume label."
+                    )
+                selected_labels = control_volume_label[selected].long()
+                selected_weights = weights[selected]
+                selected_residuals = closure_residual[selected]
+                num_components = int(selected_labels.max().detach().item()) + 1
+                component_weights = torch.zeros(
+                    num_components, device=pred.device, dtype=pred.dtype
+                )
+                component_residual_sums = torch.zeros_like(component_weights)
+                component_weights.index_add_(
+                    0, selected_labels, selected_weights
+                )
+                component_residual_sums.index_add_(
+                    0,
+                    selected_labels,
+                    selected_weights * selected_residuals,
+                )
+                nonempty = component_weights > 0
+                closure_losses.append(
+                    torch.sum(
+                        component_residual_sums[nonempty].square()
+                        / component_weights[nonempty]
+                    )
+                    / torch.sum(component_weights[nonempty])
+                )
+            else:
+                raise ValueError(
+                    "closure_granularity must be 'node' or "
+                    f"'connected_control_volume', got {closure_granularity!r}."
+                )
         else:
             divergence_losses.append(torch.mean(divergence_residual**2))
+            if closure_granularity != "node":
+                raise ValueError(
+                    "connected_control_volume closure requires a non-empty "
+                    "zone selection."
+                )
             closure_losses.append(torch.mean(closure_residual**2))
 
         if face_target_weight > 0 and hasattr(graph, "hecras_internal_face_flow_delta"):
@@ -508,12 +701,12 @@ def compute_hecras_edge_flux_head_loss(
                 face_mask
             ].to(pred.dtype)
             face_weights = None
-            if zone_mode == "zone_weight" and hasattr(graph, "zone_weight"):
+            if face_zone_mode == "zone_weight" and hasattr(graph, "zone_weight"):
                 node_weights = graph.zone_weight.to(pred.device)
                 face_weights = 0.5 * (
                     node_weights[src[face_mask]] + node_weights[dst[face_mask]]
                 )
-            elif zone_mode == "zone_weighted" and hasattr(graph, "zone_label"):
+            elif face_zone_mode == "zone_weighted" and hasattr(graph, "zone_label"):
                 labels = graph.zone_label.to(pred.device)
                 src_high = labels[src[face_mask]] == 3
                 dst_high = labels[dst[face_mask]] == 3
@@ -528,18 +721,55 @@ def compute_hecras_edge_flux_head_loss(
                     torch.full_like(face_residual, float(zone_low_weight)),
                 )
                 face_weights = 0.5 * (src_weights + dst_weights)
-            elif zone_mode == "high" and hasattr(graph, "zone_label"):
+            elif face_zone_mode == "high" and hasattr(graph, "zone_label"):
                 labels = graph.zone_label.to(pred.device)
                 face_weights = (
                     (labels[src[face_mask]] == 3) | (labels[dst[face_mask]] == 3)
                 ).to(pred.dtype)
-            elif zone_mode == "high_interior" and hasattr(graph, "zone_label"):
+            elif face_zone_mode == "zone4_touch":
+                if not hasattr(graph, "zone_label"):
+                    raise AttributeError(
+                        "face_zone_mode='zone4_touch' requires graph.zone_label."
+                    )
+                labels = graph.zone_label.to(pred.device)
+                face_weights = (
+                    (labels[src[face_mask]] == 3) | (labels[dst[face_mask]] == 3)
+                ).to(pred.dtype)
+            elif face_zone_mode == "high_interior_touch":
+                if not hasattr(
+                    graph, "hecras_high_interior_control_volume_label"
+                ):
+                    raise AttributeError(
+                        "face_zone_mode='high_interior_touch' requires "
+                        "graph.hecras_high_interior_control_volume_label."
+                    )
+                labels = graph.hecras_high_interior_control_volume_label.to(
+                    pred.device
+                )
+                face_weights = (
+                    (labels[src[face_mask]] >= 0) | (labels[dst[face_mask]] >= 0)
+                ).to(pred.dtype)
+            elif face_zone_mode == "high_interior" and hasattr(graph, "zone_label"):
                 labels = graph.zone_label.to(pred.device)
                 face_weights = (
                     (labels[src[face_mask]] == 3) & (labels[dst[face_mask]] == 3)
                 ).to(pred.dtype)
-            elif zone_mode == "all":
+            elif face_zone_mode == "all":
                 face_weights = torch.ones_like(face_residual)
+            elif face_zone_mode not in {
+                "zone_weight",
+                "zone_weighted",
+                "high",
+                "high_interior",
+                "zone4_touch",
+                "high_interior_touch",
+            }:
+                raise ValueError(
+                    "face_zone_mode must be 'all', 'high', 'high_interior', "
+                    "'zone4_touch', 'high_interior_touch', 'zone_weight', or "
+                    "'zone_weighted', got "
+                    f"{face_zone_mode!r}."
+                )
 
             local_face_target = face_target[face_mask].to(pred.dtype)
             raw_face_residual = face_residual

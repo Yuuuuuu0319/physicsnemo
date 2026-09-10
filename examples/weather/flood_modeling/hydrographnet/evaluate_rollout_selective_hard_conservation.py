@@ -1,12 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Rollout diagnostic for projected HEC-RAS edge fluxes.
+"""Rollout diagnostic for exact selective hard-conservation edge fluxes.
 
-This script evaluates, at each autoregressive step, whether the edge head can be
-projected to close the node-model volume delta.  It can either keep the
-HydroGraphNet state rollout unchanged or feed a damped projected-volume update
-back into selected conservation-projection nodes.
+The edge head is corrected with the differentiable componentwise PyTorch layer
+using train-split-only per-face RMS-squared weights. Future HEC-RAS targets are
+used only for evaluation metrics, never to construct the inference correction.
 """
 
 import argparse
@@ -23,14 +22,15 @@ from evaluate_pretrained_edge_flux_head import (
     finalize_metrics,
     rmse,
 )
+from formal_si5m_forecast_metrics import compute_formal_forecast_metrics
+from evaluate_formal_si5m_node_rollout import verify_split_contract
 from hecras_projection import (
-    build_projection_solver,
-    project_edge_flux,
     selected_node_mask,
 )
 from physicsnemo.datapipes.gnn.hydrographnet_dataset import HydroGraphDataset
 from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
 from physicsnemo.utils import load_checkpoint
+from selective_hard_conservation import project_connected_control_volume_flux
 from train import HecRasEdgeFluxHead
 from utils import compute_area_extrapolated_storage_delta
 
@@ -65,15 +65,19 @@ def rollout_local_source_delta(
     target_precipitation: torch.Tensor,
     delta_t: float,
     device: torch.device,
+    target_node_precipitation: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return inference-available precipitation/IP source volume for one step."""
 
-    previous_precip_norm = x_iter[0, 11]
-    target_precip_norm = target_precipitation.reshape(-1)[0].to(device)
-    average_precip_norm = 0.5 * (previous_precip_norm + target_precip_norm)
-    precip_mean = float(dataset.dynamic_stats["precipitation"]["mean"])
-    precip_std = float(dataset.dynamic_stats["precipitation"]["std"])
-    average_precip = average_precip_norm * precip_std + precip_mean
+    if target_node_precipitation is not None:
+        precipitation_rate = target_node_precipitation.to(device).reshape(-1)
+    else:
+        previous_precip_norm = x_iter[0, 11]
+        target_precip_norm = target_precipitation.reshape(-1)[0].to(device)
+        average_precip_norm = 0.5 * (previous_precip_norm + target_precip_norm)
+        precip_mean = float(dataset.dynamic_stats["precipitation"]["mean"])
+        precip_std = float(dataset.dynamic_stats["precipitation"]["std"])
+        precipitation_rate = average_precip_norm * precip_std + precip_mean
     area = graph_area = dataset.hecras_face_graph.get("node_surface_area")
     if graph_area is None:
         area = dataset.static_data["area_denorm"].reshape(-1)
@@ -91,7 +95,7 @@ def rollout_local_source_delta(
             dtype=x_iter.dtype,
             device=device,
         )
-    return average_precip * area * runoff_fraction * float(delta_t)
+    return precipitation_rate * area * runoff_fraction * float(delta_t)
 
 
 def attach_rollout_state_attrs(
@@ -117,6 +121,37 @@ def attach_rollout_state_attrs(
         graph.current_water_depth_denorm = current_wd
         graph.current_surface_elevation = terrain_elevation + current_wd
     graph.local_source_rate = local_source_delta / float(delta_t)
+
+
+def manning_face_volume_heuristic(graph, delta_t: float) -> torch.Tensor:
+    """Return an untuned Manning-style face-volume control in HDF orientation."""
+
+    required = (
+        "hecras_face_index",
+        "hecras_face_length",
+        "hecras_edge_physical_features",
+        "current_water_depth_denorm",
+        "current_surface_elevation",
+    )
+    missing = [name for name in required if not hasattr(graph, name)]
+    if missing:
+        raise AttributeError("Manning face heuristic requires: " + ", ".join(missing))
+    src, dst = graph.hecras_face_index
+    depth = graph.current_water_depth_denorm
+    surface = graph.current_surface_elevation
+    features = graph.hecras_edge_physical_features
+    distance = torch.clamp(features[:, 0], min=1.0e-6)
+    manning = torch.clamp(features[:, 3], min=1.0e-4)
+    hydraulic_depth = torch.clamp(0.5 * (depth[src] + depth[dst]), min=0.0)
+    surface_slope = (surface[dst] - surface[src]) / distance
+    discharge = (
+        -torch.sign(surface_slope)
+        * graph.hecras_face_length
+        * hydraulic_depth.pow(5.0 / 3.0)
+        * torch.sqrt(torch.abs(surface_slope))
+        / manning
+    )
+    return discharge * float(delta_t)
 
 
 def projection_target(
@@ -158,17 +193,59 @@ def rollout_boundary_source_delta(dataset, hydrograph_id: str, transition_index:
     edge_flow = getattr(dataset, "hecras_edge_flow_delta_by_hydrograph", {}).get(
         hydrograph_id
     )
-    if not isinstance(edge_flow, dict) or "boundary" not in edge_flow:
+    if not isinstance(edge_flow, dict):
         raise AttributeError(
-            "projection-target=hecras_boundary_source requires an edge-flow NPZ "
-            "with split internal/boundary arrays."
+            "projection-target=hecras_boundary_source requires split edge targets."
         )
-    if transition_index < 0 or transition_index >= edge_flow["boundary"].shape[0]:
+    key = "boundary" if "boundary" in edge_flow else "boundary_selected"
+    if key not in edge_flow:
+        raise AttributeError("No boundary source exists in the edge targets.")
+    if transition_index < 0 or transition_index >= edge_flow[key].shape[0]:
         raise IndexError(
             f"Boundary/source transition {transition_index} is outside "
-            f"0..{edge_flow['boundary'].shape[0] - 1} for {hydrograph_id}."
+            f"0..{edge_flow[key].shape[0] - 1} for {hydrograph_id}."
         )
-    return torch.tensor(edge_flow["boundary"][transition_index], dtype=torch.float)
+    if key == "boundary":
+        values = edge_flow[key][transition_index]
+    else:
+        values = torch.zeros(
+            dataset.static_data["xy_coords"].shape[0], dtype=torch.float
+        )
+        values[torch.as_tensor(edge_flow["selected_nodes"], dtype=torch.long)] = (
+            torch.as_tensor(edge_flow[key][transition_index], dtype=torch.float)
+        )
+    return torch.as_tensor(values, dtype=torch.float)
+
+
+def expanded_node_target(
+    edge_targets: dict,
+    target_name: str,
+    transition_index: int,
+    num_nodes: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Expand a sharded selected-node target or read a legacy full target."""
+    if target_name in edge_targets:
+        return torch.as_tensor(
+            edge_targets[target_name][transition_index],
+            dtype=dtype,
+            device=device,
+        )
+    selected_name = f"{target_name}_selected"
+    if selected_name not in edge_targets or "selected_nodes" not in edge_targets:
+        raise KeyError(f"No {target_name!r} target is available.")
+    values = torch.zeros(num_nodes, dtype=dtype, device=device)
+    selected_nodes = torch.as_tensor(
+        edge_targets["selected_nodes"], dtype=torch.long, device=device
+    )
+    values[selected_nodes] = torch.as_tensor(
+        edge_targets[selected_name][transition_index],
+        dtype=dtype,
+        device=device,
+    )
+    return values
 
 
 def feedback_node_mask(graph, args) -> torch.Tensor:
@@ -250,18 +327,11 @@ def evaluate_rollout(model, edge_head, dataset, args) -> list[dict[str, float | 
 
             inflow_seq = rollout_data["inflow"].to(args.device_obj)
             precip_seq = rollout_data["precipitation"].to(args.device_obj)
+            local_precip_seq = rollout_data.get("local_precipitation")
+            if local_precip_seq is not None:
+                local_precip_seq = local_precip_seq.to(args.device_obj)
             wd_gt_seq = rollout_data["water_depth_gt"].to(args.device_obj)
             volume_gt_seq = rollout_data["volume_gt"].to(args.device_obj)
-            projection_solver = build_projection_solver(
-                graph,
-                args.projection_mode,
-                args.device_obj,
-                args.projection_ridge,
-                high_weight=args.projection_high_weight,
-                low_weight=args.projection_low_weight,
-                solver=args.projection_solver,
-            )
-
             sums: dict[str, float] = {}
             cg_fallbacks = 0
             hydrograph_id = dataset.hydrograph_ids[idx]
@@ -317,6 +387,8 @@ def evaluate_rollout(model, edge_head, dataset, args) -> list[dict[str, float | 
                 raise ValueError(
                     "The configured edge-head active face scope selected no faces."
                 )
+            predicted_depth_sequence = []
+            predicted_volume_sequence = []
             for step in range(args.rollout_length):
                 water_depth_window = x_iter[:, 12 : 12 + args.n_time_steps]
                 volume_window = x_iter[
@@ -328,6 +400,11 @@ def evaluate_rollout(model, edge_head, dataset, args) -> list[dict[str, float | 
                     precip_seq[step],
                     args.delta_t,
                     args.device_obj,
+                    (
+                        local_precip_seq[step]
+                        if local_precip_seq is not None
+                        else None
+                    ),
                 )
                 attach_rollout_state_attrs(
                     graph,
@@ -381,7 +458,7 @@ def evaluate_rollout(model, edge_head, dataset, args) -> list[dict[str, float | 
                     boundary_source_delta = rollout_boundary_source_delta(
                         dataset,
                         hydrograph_id,
-                        args.hecras_edge_flow_time_offset
+                        dataset.hecras_edge_flow_time_offset
                         + args.n_time_steps
                         - 1
                         + step,
@@ -394,36 +471,51 @@ def evaluate_rollout(model, edge_head, dataset, args) -> list[dict[str, float | 
                     boundary_source_delta,
                     local_source_delta,
                 )
-                projected_flux, cg_info, correction_rms = project_edge_flux(
-                    graph,
+                if not hasattr(graph, "hecras_internal_face_flow_rms"):
+                    raise AttributeError(
+                        "Selective hard conservation requires train-split-only "
+                        "per-face RMS statistics."
+                    )
+                hard_result = project_connected_control_volume_flux(
                     edge_flux,
                     target,
-                    mode=args.projection_mode,
-                    ridge=args.projection_ridge,
-                    cg_rtol=args.cg_rtol,
-                    cg_maxiter=args.cg_maxiter,
-                    high_weight=args.projection_high_weight,
-                    low_weight=args.projection_low_weight,
-                    projection_solver=projection_solver,
+                    graph.hecras_face_index,
+                    graph.hecras_high_interior_control_volume_label,
+                    node_batch=getattr(graph, "batch", None),
+                    active_face_mask=active_face_mask,
+                    face_correction_weight=(
+                        graph.hecras_internal_face_flow_rms.to(
+                            edge_flux.device
+                        ).reshape(-1).square()
+                    ),
+                    ridge=0.0,
                 )
-                if cg_info != 0:
-                    cg_fallbacks += 1
+                projected_flux = hard_result.edge_flux.reshape(-1)
+                correction_rms = float(
+                    hard_result.face_correction.float().square().mean().sqrt().item()
+                )
 
                 original_divergence = compute_divergence(graph, edge_flux)
                 projected_divergence = compute_divergence(graph, projected_flux)
                 target_transition_index = (
-                    args.hecras_edge_flow_time_offset
+                    dataset.hecras_edge_flow_time_offset
                     + args.n_time_steps
                     - 1
                     + step
                 )
-                true_internal_delta = torch.as_tensor(
-                    edge_targets["internal"][target_transition_index],
+                true_internal_delta = expanded_node_target(
+                    edge_targets,
+                    "internal",
+                    target_transition_index,
+                    pred_delta.numel(),
                     dtype=pred_delta.dtype,
                     device=args.device_obj,
                 )
-                true_boundary_delta = torch.as_tensor(
-                    edge_targets["boundary"][target_transition_index],
+                true_boundary_delta = expanded_node_target(
+                    edge_targets,
+                    "boundary",
+                    target_transition_index,
+                    pred_delta.numel(),
                     dtype=pred_delta.dtype,
                     device=args.device_obj,
                 )
@@ -431,6 +523,16 @@ def evaluate_rollout(model, edge_head, dataset, args) -> list[dict[str, float | 
                     edge_targets["face"][target_transition_index],
                     dtype=edge_flux.dtype,
                     device=args.device_obj,
+                )
+                raw_hecras_face_delta = torch.as_tensor(
+                    edge_targets.get("raw_face", edge_targets["face"])[
+                        target_transition_index
+                    ],
+                    dtype=edge_flux.dtype,
+                    device=args.device_obj,
+                )
+                manning_face_delta = manning_face_volume_heuristic(
+                    graph, args.delta_t
                 )
                 additive_source_delta = torch.zeros_like(projected_divergence)
                 if args.projection_target == "hecras_boundary_source":
@@ -471,6 +573,8 @@ def evaluate_rollout(model, edge_head, dataset, args) -> list[dict[str, float | 
                     if args.state_update == "projected_volume"
                     else original_new_volume
                 )
+                predicted_depth_sequence.append(new_wd)
+                predicted_volume_sequence.append(selected_new_volume)
                 wd_error = new_wd - wd_gt_seq[step]
                 original_volume_error = original_new_volume - volume_gt_seq[step]
                 projected_volume_error = projected_new_volume - volume_gt_seq[step]
@@ -549,8 +653,8 @@ def evaluate_rollout(model, edge_head, dataset, args) -> list[dict[str, float | 
                     projected_flux - edge_flux,
                     edge_flux,
                 )
-                add_metric(sums, "edge_flux_rms_ft3", rmse(edge_flux))
-                add_metric(sums, "projected_edge_flux_rms_ft3", rmse(projected_flux))
+                add_metric(sums, "edge_flux_rms_m3", rmse(edge_flux))
+                add_metric(sums, "projected_edge_flux_rms_m3", rmse(projected_flux))
                 add_residual_metrics(
                     sums,
                     "edge_face_error",
@@ -581,6 +685,78 @@ def evaluate_rollout(model, edge_head, dataset, args) -> list[dict[str, float | 
                     (edge_flux - true_face_delta)[high_high_face_mask],
                     true_face_delta[high_high_face_mask],
                 )
+                add_residual_metrics(
+                    sums,
+                    "hard_edge_face_error",
+                    projected_flux - true_face_delta,
+                    true_face_delta,
+                )
+                add_residual_metrics(
+                    sums,
+                    "hard_active_edge_face_error",
+                    (projected_flux - true_face_delta)[active_face_mask],
+                    true_face_delta[active_face_mask],
+                )
+                add_residual_metrics(
+                    sums,
+                    "hard_high_interior_touch_edge_face_error",
+                    (projected_flux - true_face_delta)[
+                        high_interior_touch_face_mask
+                    ],
+                    true_face_delta[high_interior_touch_face_mask],
+                )
+                add_residual_metrics(
+                    sums,
+                    "raw_hecras_high_interior_touch_edge_face_error",
+                    (edge_flux - raw_hecras_face_delta)[
+                        high_interior_touch_face_mask
+                    ],
+                    raw_hecras_face_delta[high_interior_touch_face_mask],
+                )
+                add_residual_metrics(
+                    sums,
+                    "raw_hecras_zero_flow_control_error",
+                    -raw_hecras_face_delta[high_interior_touch_face_mask],
+                    raw_hecras_face_delta[high_interior_touch_face_mask],
+                )
+                add_residual_metrics(
+                    sums,
+                    "raw_hecras_manning_control_error",
+                    (manning_face_delta - raw_hecras_face_delta)[
+                        high_interior_touch_face_mask
+                    ],
+                    raw_hecras_face_delta[high_interior_touch_face_mask],
+                )
+                add_residual_metrics(
+                    sums,
+                    "raw_hecras_hard_high_interior_touch_edge_face_error",
+                    (projected_flux - raw_hecras_face_delta)[
+                        high_interior_touch_face_mask
+                    ],
+                    raw_hecras_face_delta[high_interior_touch_face_mask],
+                )
+                add_residual_metrics(
+                    sums,
+                    "target_projection_high_interior_touch_face_correction",
+                    (true_face_delta - raw_hecras_face_delta)[
+                        high_interior_touch_face_mask
+                    ],
+                    raw_hecras_face_delta[high_interior_touch_face_mask],
+                )
+                directional_mask = high_interior_touch_face_mask & (
+                    torch.abs(raw_hecras_face_delta) > 1.0e-6
+                )
+                if torch.any(directional_mask):
+                    add_metric(
+                        sums,
+                        "raw_hecras_active_direction_accuracy",
+                        torch.mean(
+                            (
+                                torch.sign(edge_flux[directional_mask])
+                                == torch.sign(raw_hecras_face_delta[directional_mask])
+                            ).to(torch.float32)
+                        ),
+                    )
                 add_residual_metrics(
                     sums,
                     "internal_divergence_error",
@@ -646,14 +822,14 @@ def evaluate_rollout(model, edge_head, dataset, args) -> list[dict[str, float | 
                     )[low_low_face_mask]
                     add_metric(
                         sums,
-                        "low_low_projection_correction_rms_ft3",
+                        "low_low_projection_correction_rms_m3",
                         rmse(low_low_correction),
                     )
-                    sums["low_low_projection_correction_max_abs_ft3"] = sums.get(
-                        "low_low_projection_correction_max_abs_ft3", 0.0
+                    sums["low_low_projection_correction_max_abs_m3"] = sums.get(
+                        "low_low_projection_correction_max_abs_m3", 0.0
                     ) + torch.max(torch.abs(low_low_correction)).detach().item()
-                sums["projection_correction_rms_ft3"] = (
-                    sums.get("projection_correction_rms_ft3", 0.0) + correction_rms
+                sums["projection_correction_rms_m3"] = (
+                    sums.get("projection_correction_rms_m3", 0.0) + correction_rms
                 )
 
                 for zone in range(4):
@@ -719,30 +895,48 @@ def evaluate_rollout(model, edge_head, dataset, args) -> list[dict[str, float | 
                     else None,
                 )
 
-            row = finalize_metrics(sums)
+            row = finalize_metrics(sums, volume_unit_suffix="m3")
             for key in list(row):
                 if not key.endswith(
                     (
                         "_relative_rmse",
-                        "_rmse_ft3",
-                        "_mae_ft3",
-                        "_bias_ft3",
-                        "_target_rms_ft3",
+                        "_rmse_m3",
+                        "_mae_m3",
+                        "_bias_m3",
+                        "_target_rms_m3",
                     )
                 ):
                     row[key] = row[key] / max(args.rollout_length, 1)
+            row.update(
+                compute_formal_forecast_metrics(
+                    torch.stack(predicted_depth_sequence),
+                    wd_gt_seq[: args.rollout_length],
+                    torch.stack(predicted_volume_sequence),
+                    volume_gt_seq[: args.rollout_length],
+                    zone_label,
+                    water_depth_mean=dataset.dynamic_stats["water_depth"]["mean"],
+                    water_depth_std=dataset.dynamic_stats["water_depth"]["std"],
+                    volume_mean=dataset.dynamic_stats["volume"]["mean"],
+                    volume_std=dataset.dynamic_stats["volume"]["std"],
+                    delta_t_seconds=args.delta_t,
+                    wet_depth_threshold_m=args.wet_depth_threshold_m,
+                )
+            )
             row["hydrograph_id"] = hydrograph_id
             row["rollout_length"] = args.rollout_length
             row["projection_mode"] = args.projection_mode
             row["projection_target"] = args.projection_target
+            row["projection_algorithm"] = (
+                "differentiable_componentwise_training_face_rms_squared_exact"
+            )
             row["storage_delta_mode"] = args.storage_delta_mode
-            row["projection_ridge"] = args.projection_ridge
+            row["projection_ridge"] = 0.0
             row["state_update"] = args.state_update
             row["projected_volume_alpha"] = args.projected_volume_alpha
             row["feedback_mode"] = args.feedback_mode
             row["projection_high_weight"] = args.projection_high_weight
             row["projection_low_weight"] = args.projection_low_weight
-            row["projection_solver"] = args.projection_solver
+            row["projection_solver"] = "closed_form_componentwise_torch"
             row["future_hecras_face_flow_used_for_inference"] = (
                 args.projection_target
                 in {"initial_boundary_source", "hecras_boundary_source"}
@@ -787,6 +981,7 @@ def average_rows(rows: list[dict[str, float | str | int]]) -> dict[str, float | 
         "rollout_length": rows[0]["rollout_length"],
         "projection_mode": rows[0]["projection_mode"],
         "projection_target": rows[0]["projection_target"],
+        "projection_algorithm": rows[0]["projection_algorithm"],
         "storage_delta_mode": rows[0]["storage_delta_mode"],
         "projection_ridge": rows[0]["projection_ridge"],
         "state_update": rows[0]["state_update"],
@@ -826,6 +1021,10 @@ def average_rows(rows: list[dict[str, float | str | int]]) -> dict[str, float | 
 def build_dataset(args: argparse.Namespace) -> HydroGraphDataset:
     eval_data_dir = args.test_data_dir or args.data_dir
     norm_stats_dir = args.train_data_dir or args.data_dir
+    has_edge_targets = (
+        args.hecras_edge_flow_npz is not None
+        or args.hecras_conservative_edge_target_dir is not None
+    )
     return HydroGraphDataset(
         data_dir=eval_data_dir,
         prefix=args.prefix,
@@ -840,13 +1039,21 @@ def build_dataset(args: argparse.Namespace) -> HydroGraphDataset:
         norm_stats_dir=norm_stats_dir,
         return_hecras_face=True,
         hecras_face_graph_file=args.hecras_face_graph_file,
-        return_hecras_edge_flow=args.hecras_edge_flow_npz is not None,
+        return_hecras_edge_flow=has_edge_targets,
         hecras_edge_flow_npz=args.hecras_edge_flow_npz,
-        hecras_edge_flow_mode="internal_plus_boundary_source",
+        hecras_conservative_edge_target_dir=(
+            args.hecras_conservative_edge_target_dir
+        ),
+        hecras_edge_flow_mode=(
+            "conservative_sharded"
+            if args.hecras_conservative_edge_target_dir is not None
+            else "internal_plus_boundary_source"
+        ),
         hecras_edge_flow_face_stats_npz=args.hecras_edge_flow_face_stats_npz,
         hecras_edge_flow_scale_stats_npz=args.hecras_edge_flow_scale_stats_npz,
         precipitation_unit_conversion=args.precipitation_unit_conversion,
         local_source_runoff_mode=args.local_source_runoff_mode,
+        require_node_precipitation=True,
         hecras_edge_flow_time_offset=args.hecras_edge_flow_time_offset,
     )
 
@@ -857,17 +1064,24 @@ def main() -> None:
     parser.add_argument("--test-data-dir")
     parser.add_argument("--train-data-dir")
     parser.add_argument("--ids-file", required=True)
+    parser.add_argument(
+        "--split-role", choices=("validation", "test"), default="validation"
+    )
+    parser.add_argument("--split-manifest", type=Path)
+    parser.add_argument("--test-authorization-file", type=Path)
+    parser.add_argument("--enforce-formal-split-contract", action="store_true")
     parser.add_argument("--prefix", default="M80")
     parser.add_argument("--rollout-length", type=int, default=10)
     parser.add_argument("--n-time-steps", type=int, default=2)
-    parser.add_argument("--delta-t", type=float, default=1800.0)
+    parser.add_argument("--delta-t", type=float, default=300.0)
+    parser.add_argument("--wet-depth-threshold-m", type=float, default=0.01)
     parser.add_argument("--precipitation-unit-conversion", type=float, default=2.7778e-7)
     parser.add_argument(
         "--local-source-runoff-mode",
         choices=("ip_fraction", "full_area"),
         default="ip_fraction",
     )
-    parser.add_argument("--hecras-edge-flow-time-offset", type=int, default=0)
+    parser.add_argument("--hecras-edge-flow-time-offset", type=int)
     parser.add_argument(
         "--storage-delta-mode",
         choices=("dataset_volume", "capped_volume", "area_extrapolated_volume"),
@@ -887,7 +1101,7 @@ def main() -> None:
     parser.add_argument("--edge-head-use-previous-face-flow", action="store_true")
     parser.add_argument("--edge-head-use-edge-physical-features", action="store_true")
     parser.add_argument("--edge-head-use-node-prediction-features", action="store_true")
-    parser.add_argument("--edge-head-output-mode", default="asinh_face_transition_rms")
+    parser.add_argument("--edge-head-output-mode", default="asinh_per_face_rms")
     parser.add_argument(
         "--edge-head-active-face-mode",
         choices=("all", "zone4_touch", "high_interior_touch"),
@@ -895,6 +1109,7 @@ def main() -> None:
     )
     parser.add_argument("--hecras-face-graph-file", required=True)
     parser.add_argument("--hecras-edge-flow-npz")
+    parser.add_argument("--hecras-conservative-edge-target-dir")
     parser.add_argument("--hecras-edge-flow-face-stats-npz")
     parser.add_argument("--hecras-edge-flow-scale-stats-npz")
     parser.add_argument("--projection-mode", default="all")
@@ -957,7 +1172,19 @@ def main() -> None:
     parser.add_argument("--edge-checkpoint-epoch", type=int, default=0)
     parser.add_argument("--output-csv", required=True, type=Path)
     args = parser.parse_args()
+    if args.enforce_formal_split_contract:
+        verify_split_contract(args)
     args.device_obj = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    if args.projection_mode != "high_interior_control_volume":
+        raise ValueError(
+            "Selective hard conservation requires "
+            "projection-mode=high_interior_control_volume."
+        )
+    if args.projection_target != "known_local_source":
+        raise ValueError(
+            "Selective hard conservation requires "
+            "projection-target=known_local_source."
+        )
     if args.projection_target == "known_local_source" and args.projection_mode not in {
         "interior",
         "high_interior",

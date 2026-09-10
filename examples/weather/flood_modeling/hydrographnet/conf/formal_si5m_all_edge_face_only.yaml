@@ -1,0 +1,10 @@
+defaults:
+  - formal_si5m_selective_face_only
+  - _self_
+
+# Full-face learned-edge control for measuring the value and runtime cost of
+# selective execution. It remains HydroGraphNet-based, not DUALFloodGNN.
+seed: 0
+ckpt_path: /mnt/8tb_hdd2/joyce/formal_si5m_runs/all_edge_face_only_seed0
+hecras_edge_flux_head_active_face_mode: all
+hecras_edge_flux_head_face_zone_mode: all

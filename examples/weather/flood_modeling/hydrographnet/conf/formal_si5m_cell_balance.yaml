@@ -1,0 +1,21 @@
+defaults:
+  - formal_si5m_common
+  - _self_
+
+# Cell-only control: period-average Face Flow is collapsed to a per-cell net
+# budget during preprocessing. The model never predicts or receives edge flow.
+seed: 0
+ckpt_path: /mnt/8tb_hdd2/joyce/formal_si5m_runs/cell_balance_seed0
+
+use_hecras_cell_balance_loss: true
+hecras_cell_balance_target_dir: /mnt/8tb_hdd2/joyce/hecras-dataset/Linux_RAS_v66/Minxiong/outputs_si5m_v2_h1h100/HGN_dataset/conservative_edge_targets
+hecras_cell_balance_time_offset: null
+hecras_cell_balance_zone_mode: high
+hecras_cell_balance_loss_normalization: target_rms
+
+# Development candidate only. The validation split selects the final value
+# from the predeclared grid in the formal publication protocol.
+hecras_cell_balance_loss_weight: 0.1
+
+use_hecras_edge_flux_head: false
+use_selective_hard_conservation: false

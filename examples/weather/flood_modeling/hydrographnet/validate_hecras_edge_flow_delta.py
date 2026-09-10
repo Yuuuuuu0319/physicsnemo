@@ -35,6 +35,19 @@ CELL_BALANCE_PATH = RESULT_BASE + "Cell Flow Balance"
 PRECIPITATION_PATH = RESULT_BASE + "Cell Cumulative Precipitation Depth"
 
 
+def infer_integrated_flow_unit(hdf: h5py.File) -> str:
+    """Return the volume unit produced by integrating native Face Flow in time."""
+    raw = hdf.attrs.get("Units System", "")
+    if isinstance(raw, bytes):
+        raw = raw.decode(errors="ignore")
+    normalized = " ".join(str(raw).lower().replace("_", " ").split())
+    if normalized in {"si", "si units", "metric", "metric units"}:
+        return "m3"
+    if normalized in {"us customary", "english", "english units"}:
+        return "ft3"
+    raise ValueError(f"Unsupported or missing HEC-RAS unit system: {raw!r}")
+
+
 def hydrograph_sort_key(value: str) -> tuple[str, int | str]:
     match = re.fullmatch(r"([A-Za-z]+)(\d+)", value)
     if match:
@@ -92,7 +105,7 @@ def signed_face_sum(
     num_nodes: int,
     mode: str,
 ) -> np.ndarray:
-    """Convert HEC-RAS face flow cfs to node-wise signed net flow cfs."""
+    """Convert native HEC-RAS face flow to node-wise signed net flow."""
     mapped_faces = np.full_like(face_cells, -1)
     valid = (face_cells >= 0) & (face_cells < hdf_to_hgn.shape[0])
     mapped_faces[valid] = hdf_to_hgn[face_cells[valid]]
@@ -145,6 +158,7 @@ def summarize_residual(
     edge_delta: np.ndarray,
     balance_delta: np.ndarray,
     zone_label: np.ndarray | None,
+    volume_unit: str,
 ) -> dict[str, object]:
     residual = edge_delta - balance_delta
     target_rms = float(np.sqrt(np.mean(balance_delta**2)))
@@ -154,16 +168,17 @@ def summarize_residual(
         "mode": mode,
         "num_intervals": int(edge_delta.shape[0]),
         "num_nodes": int(edge_delta.shape[1]),
-        "target_rms_ft3": target_rms,
-        "edge_rms_ft3": float(np.sqrt(np.mean(edge_delta**2))),
-        "residual_rmse_ft3": rmse,
-        "residual_mae_ft3": float(np.mean(np.abs(residual))),
-        "residual_bias_ft3": float(np.mean(residual)),
+        "volume_unit": volume_unit,
+        "target_rms_volume": target_rms,
+        "edge_rms_volume": float(np.sqrt(np.mean(edge_delta**2))),
+        "residual_rmse_volume": rmse,
+        "residual_mae_volume": float(np.mean(np.abs(residual))),
+        "residual_bias_volume": float(np.mean(residual)),
         "relative_rmse": rmse / target_rms if target_rms else float("nan"),
         "correlation": float(
             np.corrcoef(edge_delta.reshape(-1), balance_delta.reshape(-1))[0, 1]
         ),
-        "domain_residual_rmse_ft3": float(
+        "domain_residual_rmse_volume": float(
             np.sqrt(np.mean(np.sum(residual, axis=1) ** 2))
         ),
     }
@@ -175,7 +190,7 @@ def summarize_residual(
                 zone_target = balance_delta[:, mask]
                 zone_target_rms = float(np.sqrt(np.mean(zone_target**2)))
                 zone_rmse = float(np.sqrt(np.mean(zone_residual**2)))
-                row[f"zone_{zone}_residual_rmse_ft3"] = zone_rmse
+                row[f"zone_{zone}_residual_rmse_volume"] = zone_rmse
                 row[f"zone_{zone}_relative_rmse"] = (
                     zone_rmse / zone_target_rms if zone_target_rms else float("nan")
                 )
@@ -215,16 +230,16 @@ def write_markdown(path: Path, rows: list[dict[str, object]], args: argparse.Nam
         "",
         "## Summary",
         "",
-        "| Event | Mode | Relative RMSE | RMSE (ft^3) | Correlation | Zone 3 RMSE (ft^3) | Zone 3 Relative RMSE |",
-        "|---|---|---:|---:|---:|---:|---:|",
+        "| Event | Mode | Unit | Relative RMSE | RMSE | Correlation | Zone 3 RMSE | Zone 3 Relative RMSE |",
+        "|---|---|---|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         lines.append(
-            f"| {row['event_id']} | {row['mode']} | "
+            f"| {row['event_id']} | {row['mode']} | {row['volume_unit']} | "
             f"{float(row['relative_rmse']):.6e} | "
-            f"{float(row['residual_rmse_ft3']):.6e} | "
+            f"{float(row['residual_rmse_volume']):.6e} | "
             f"{float(row['correlation']):.6f} | "
-            f"{float(row.get('zone_3_residual_rmse_ft3', float('nan'))):.6e} | "
+            f"{float(row.get('zone_3_residual_rmse_volume', float('nan'))):.6e} | "
             f"{float(row.get('zone_3_relative_rmse', float('nan'))):.6e} |"
         )
     lines.extend(
@@ -291,6 +306,7 @@ def main() -> None:
             raise KeyError(f"No HDF path found for {event_id}")
         hgn_time_days = np.loadtxt(args.data_dir / f"{args.prefix}_US_InF_{event_id}.txt")[:, 0]
         with h5py.File(hdf_path, "r") as hdf:
+            volume_unit = infer_integrated_flow_unit(hdf)
             hdf_time_days = np.asarray(hdf[RESULT_TIME_PATH], dtype=np.float64)
             hdf_indices = match_hgn_times_to_hdf(hgn_time_days, hdf_time_days)
             hdf_time_seconds = hdf_time_days * 86400.0
@@ -308,7 +324,14 @@ def main() -> None:
                 edge_delta = integrate_intervals(net_flow, hdf_time_seconds, hdf_indices)
                 event_edge_deltas[mode] = edge_delta
                 rows.append(
-                    summarize_residual(event_id, mode, edge_delta, balance_delta, zone_label)
+                    summarize_residual(
+                        event_id,
+                        mode,
+                        edge_delta,
+                        balance_delta,
+                        zone_label,
+                        volume_unit,
+                    )
                 )
                 if args.output_npz:
                     if args.store_mode in {"all", mode}:

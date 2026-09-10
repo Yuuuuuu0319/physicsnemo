@@ -1,0 +1,15 @@
+defaults:
+  - formal_si5m_selective_hard
+  - _self_
+
+# Proposed rollout-trained candidate. Four five-minute transitions are
+# optimized jointly, and the exact selective edge projection supplies the
+# volume state fed to the next transition only inside fixed high-fidelity
+# interior control volumes. Alpha is fixed at 1.0, not validation-tuned.
+seed: 0
+ckpt_path: /mnt/8tb_hdd2/joyce/formal_si5m_runs/selective_hard_rollout_seed0
+training_rollout_steps: 4
+training_rollout_discount: 1.0
+training_rollout_backprop_through_time: true
+training_rollout_volume_feedback: selective_projected
+training_rollout_projected_volume_alpha: 1.0

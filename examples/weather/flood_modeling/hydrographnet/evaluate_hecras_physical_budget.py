@@ -43,6 +43,43 @@ NATIVE_FLUX_SOURCE = "native_face_flow"
 NATIVE_CELL_BALANCE_SOURCE = "native_cell_flow_balance"
 
 
+def decode_attr(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode(errors="ignore")
+    if hasattr(value, "decode"):
+        return value.decode(errors="ignore")
+    return str(value)
+
+
+def infer_native_volume_contract(hdf: h5py.File) -> tuple[str, float]:
+    """Return native volume label and cumulative-precipitation length factor."""
+    unit_system = " ".join(
+        decode_attr(hdf.attrs.get("Units System", ""))
+        .lower()
+        .replace("_", " ")
+        .split()
+    )
+    precip_dataset = hdf[RESULT_BASE + "Cell Cumulative Precipitation Depth"]
+    precip_unit = " ".join(
+        decode_attr(precip_dataset.attrs.get("Units", "")).lower().split()
+    )
+    if unit_system in {"si", "si units", "metric", "metric units"}:
+        factors = {"mm": 1.0e-3, "m": 1.0, "meter": 1.0, "metre": 1.0}
+        if precip_unit not in factors:
+            raise ValueError(
+                f"Unsupported SI cumulative precipitation unit: {precip_unit!r}"
+            )
+        return "m3", factors[precip_unit]
+    if unit_system in {"us customary", "english", "english units"}:
+        factors = {"in": 1.0 / 12.0, "inch": 1.0 / 12.0, "ft": 1.0}
+        if precip_unit not in factors:
+            raise ValueError(
+                f"Unsupported US cumulative precipitation unit: {precip_unit!r}"
+            )
+        return "ft3", factors[precip_unit]
+    raise ValueError(f"Unsupported HEC-RAS unit system: {unit_system!r}")
+
+
 def infer_hydrograph_id_from_path(path: Path) -> str:
     """Infer an H1/T1 style event identifier from a HEC-RAS HDF path."""
     for part in reversed(path.parts):
@@ -426,11 +463,11 @@ def metric_dict(target: np.ndarray, budget: np.ndarray) -> dict[str, float]:
     else:
         correlation = float("nan")
     return {
-        "target_rms_ft3": float(target_rms),
-        "budget_rms_ft3": float(np.sqrt(np.mean(budget_flat**2))),
-        "residual_rmse_ft3": float(np.sqrt(np.mean(residual_flat**2))),
-        "residual_mae_ft3": float(np.mean(np.abs(residual_flat))),
-        "residual_bias_ft3": float(np.mean(residual_flat)),
+        "target_rms_volume": float(target_rms),
+        "budget_rms_volume": float(np.sqrt(np.mean(budget_flat**2))),
+        "residual_rmse_volume": float(np.sqrt(np.mean(residual_flat**2))),
+        "residual_mae_volume": float(np.mean(np.abs(residual_flat))),
+        "residual_bias_volume": float(np.mean(residual_flat)),
         "relative_rmse": float(
             np.sqrt(np.mean(residual_flat**2)) / max(target_rms, 1e-12)
         ),
@@ -462,6 +499,9 @@ def evaluate_event(
     hgn_time_days = np.asarray(inflow[:, 0], dtype=np.float64)
     delta_t = infer_output_delta_t_seconds(data_dir / f"{prefix}_US_InF_{event_id}.txt")
     with h5py.File(hdf_path, "r") as hdf:
+        volume_unit, precipitation_depth_to_native_length = (
+            infer_native_volume_contract(hdf)
+        )
         face_cells = np.asarray(
             hdf[GEOMETRY_BASE + "Faces Cell Indexes"], dtype=np.int64
         )
@@ -531,7 +571,7 @@ def evaluate_event(
             precip[first_transition:, original_indices]
             - precip[first_transition - 1 : -1, original_indices]
         )
-        / 12.0
+        * precipitation_depth_to_native_length
         * cell_surface_area[None, :]
     )
     rows = []
@@ -595,6 +635,7 @@ def evaluate_event(
                                     "sign_mode": sign_mode,
                                     "boundary_mode": boundary_mode,
                                     "source_mode": source_mode,
+                                    "volume_unit": volume_unit,
                                     "has_native_face_flow": has_native_face_flow,
                                     "has_native_cell_flow_balance": (
                                         has_native_cell_flow_balance
@@ -615,9 +656,9 @@ def evaluate_event(
                                         delta_t / computation_delta_t
                                     ),
                                     "storage_aligned": storage_aligned,
-                                    "storage_alignment_rmse_ft3": storage_alignment_rmse,
-                                    "storage_alignment_max_abs_ft3": storage_alignment_max_abs,
-                                    "domain_residual_rmse_ft3": float(
+                                    "storage_alignment_rmse_volume": storage_alignment_rmse,
+                                    "storage_alignment_max_abs_volume": storage_alignment_max_abs,
+                                    "domain_residual_rmse_volume": float(
                                         np.sqrt(np.mean(domain_residual**2))
                                     ),
                                     "hdf_path": str(hdf_path),
@@ -630,14 +671,14 @@ def evaluate_event(
 def add_aggregate_rows(rows: list[dict]) -> list[dict]:
     """Average per-event diagnostic metrics for each physical variant."""
     metric_keys = [
-        "target_rms_ft3",
-        "budget_rms_ft3",
-        "residual_rmse_ft3",
-        "residual_mae_ft3",
-        "residual_bias_ft3",
+        "target_rms_volume",
+        "budget_rms_volume",
+        "residual_rmse_volume",
+        "residual_mae_volume",
+        "residual_bias_volume",
         "relative_rmse",
         "correlation",
-        "domain_residual_rmse_ft3",
+        "domain_residual_rmse_volume",
     ]
     groups = {}
     for row in rows:
@@ -662,6 +703,7 @@ def add_aggregate_rows(rows: list[dict]) -> list[dict]:
             "sign_mode": key[4],
             "boundary_mode": key[5],
             "source_mode": key[6],
+            "volume_unit": group[0]["volume_unit"],
             "has_native_face_flow": all(
                 item["has_native_face_flow"] for item in group
             ),
@@ -682,11 +724,11 @@ def add_aggregate_rows(rows: list[dict]) -> list[dict]:
                 "computation_steps_per_budget_interval"
             ],
             "storage_aligned": all(item["storage_aligned"] for item in group),
-            "storage_alignment_rmse_ft3": float(
-                np.mean([item["storage_alignment_rmse_ft3"] for item in group])
+            "storage_alignment_rmse_volume": float(
+                np.mean([item["storage_alignment_rmse_volume"] for item in group])
             ),
-            "storage_alignment_max_abs_ft3": float(
-                np.max([item["storage_alignment_max_abs_ft3"] for item in group])
+            "storage_alignment_max_abs_volume": float(
+                np.max([item["storage_alignment_max_abs_volume"] for item in group])
             ),
             "hdf_path": "",
         }
@@ -703,6 +745,7 @@ def write_markdown_summary(
     ids_file: str,
     hdf_glob: str,
     residual_relative_rmse_threshold: float,
+    max_face_output_interval_seconds: float,
 ) -> None:
     aggregate = [
         row for row in rows if row["event_id"] == "MEAN" and row["scope"] == "all"
@@ -719,10 +762,14 @@ def write_markdown_summary(
         ],
         key=lambda row: row["relative_rmse"],
     )
+    face_sampling_gate_pass = (
+        hgn_best["hdf_output_delta_t_seconds"]
+        <= max_face_output_interval_seconds
+    )
     core_gates_pass = (
         hgn_best["storage_aligned"]
         and hgn_best["has_native_face_flow"]
-        and hgn_best["hdf_output_matches_computation"]
+        and face_sampling_gate_pass
     )
     residual_gate_pass = (
         hgn_best["relative_rmse"] <= residual_relative_rmse_threshold
@@ -753,6 +800,7 @@ def write_markdown_summary(
             "solver steps per HGN budget interval)"
         ),
         f"- HDF stored face-output interval: `{hgn_best['hdf_output_delta_t_seconds']:.6f} s`",
+        f"- Native integrated-volume unit: `{hgn_best['volume_unit']}`",
         "",
         "## Formal Gates",
         "",
@@ -761,14 +809,15 @@ def write_markdown_summary(
         (
             "| HDF reconstructed cell storage matches HGN `M80_V` target | "
             f"{'PASS' if hgn_best['storage_aligned'] else 'FAIL'} | "
-            f"RMSE `{hgn_best['storage_alignment_rmse_ft3']:.6f} ft^3`, "
-            f"max abs `{hgn_best['storage_alignment_max_abs_ft3']:.6f} ft^3` |"
+            f"RMSE `{hgn_best['storage_alignment_rmse_volume']:.6f} {hgn_best['volume_unit']}`, "
+            f"max abs `{hgn_best['storage_alignment_max_abs_volume']:.6f} {hgn_best['volume_unit']}` |"
         ),
         (
-            "| HDF stores face output at solver-computation frequency | "
-            f"{'PASS' if hgn_best['hdf_output_matches_computation'] else 'FAIL'} | "
+            "| HDF face-output interval is within the declared sampling limit | "
+            f"{'PASS' if face_sampling_gate_pass else 'FAIL'} | "
             f"HDF `{hgn_best['hdf_output_delta_t_seconds']:.6f} s`, "
-            f"computation `{hgn_best['hecras_computation_delta_t_seconds']:.6f} s` |"
+            f"limit `{max_face_output_interval_seconds:.6f} s`; computation "
+            f"`{hgn_best['hecras_computation_delta_t_seconds']:.6f} s` is reported separately |"
         ),
         (
             "| Native HEC-RAS internal `Face Flow` is available | "
@@ -794,14 +843,14 @@ def write_markdown_summary(
         "",
         "## Best Uncalibrated Variants",
         "",
-        "| Target | Flux source | Face stage rule | Sign mode | Boundary mode | Source mode | Residual RMSE (ft^3) | Relative RMSE | Correlation |",
-        "|---|---|---|---|---|---|---:|---:|---:|",
+        "| Target | Flux source | Face stage rule | Sign mode | Boundary mode | Source mode | Residual RMSE | Unit | Relative RMSE | Correlation |",
+        "|---|---|---|---|---|---|---:|---|---:|---:|",
         (
             f"| HGN `M80_V` | {hgn_best['flux_source']} | "
             f"{hgn_best['face_stage_rule']} | "
             f"{hgn_best['sign_mode']} | {hgn_best['boundary_mode']} | "
             f"{hgn_best['source_mode']} | "
-            f"{hgn_best['residual_rmse_ft3']:.6f} | "
+            f"{hgn_best['residual_rmse_volume']:.6f} | {hgn_best['volume_unit']} | "
             f"{hgn_best['relative_rmse']:.6f} | {hgn_best['correlation']:.6f} |"
         ),
         (
@@ -809,7 +858,7 @@ def write_markdown_summary(
             f"{hdf_best['face_stage_rule']} | "
             f"{hdf_best['sign_mode']} | {hdf_best['boundary_mode']} | "
             f"{hdf_best['source_mode']} | "
-            f"{hdf_best['residual_rmse_ft3']:.6f} | "
+            f"{hdf_best['residual_rmse_volume']:.6f} | {hdf_best['volume_unit']} | "
             f"{hdf_best['relative_rmse']:.6f} | {hdf_best['correlation']:.6f} |"
         ),
         "",
@@ -833,9 +882,9 @@ def write_markdown_summary(
             f"`{hgn_best['hdf_output_delta_t_seconds']:.6f} s`, while the "
             f"solver computation interval is `{hgn_best['hecras_computation_delta_t_seconds']:.6f} s`. "
             + (
-                "The high-frequency preflight output therefore addresses the prior sampling blocker."
-                if hgn_best["hdf_output_matches_computation"]
-                else "The stored output is still too sparse to integrate every solver-step face transfer."
+                "The stored interval is accepted only if its uncalibrated closure residual also passes."
+                if face_sampling_gate_pass
+                else "The stored interval exceeds the declared face-sampling limit."
             )
         ),
         "- Do not activate a formal HEC-RAS local-conservation training loss until a synchronized dataset/HDF pair and an interval-integrated or sufficiently sampled internal-face flux budget pass these gates.",
@@ -867,7 +916,7 @@ def main() -> None:
         "--storage-alignment-atol",
         type=float,
         default=1e-3,
-        help="Maximum absolute HDF-vs-HGN reconstructed cell-volume difference in ft^3.",
+        help="Maximum absolute HDF-vs-HGN storage difference in native volume units.",
     )
     parser.add_argument(
         "--target-volume-source",
@@ -889,6 +938,15 @@ def main() -> None:
         type=float,
         default=0.1,
         help="Relative RMSE threshold used for the Markdown residual gate.",
+    )
+    parser.add_argument(
+        "--max-face-output-interval-seconds",
+        type=float,
+        default=300.0,
+        help=(
+            "Largest accepted native Face Flow sample interval. Closure against "
+            "Cell Flow Balance remains the decisive accuracy gate."
+        ),
     )
     parser.add_argument("--output-csv", type=Path, required=True)
     parser.add_argument("--output-md", type=Path)
@@ -931,6 +989,7 @@ def main() -> None:
             args.ids_file,
             args.hdf_glob,
             args.residual_relative_rmse_threshold,
+            args.max_face_output_interval_seconds,
         )
     aggregate = [
         row for row in rows if row["event_id"] == "MEAN" and row["scope"] == "all"

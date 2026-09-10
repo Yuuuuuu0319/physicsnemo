@@ -50,7 +50,9 @@ def add_residual_metrics(
     sums[f"{prefix}_count"] = sums.get(f"{prefix}_count", 0.0) + float(count)
 
 
-def finalize_metrics(sums: dict[str, float]) -> dict[str, float]:
+def finalize_metrics(
+    sums: dict[str, float], volume_unit_suffix: str = "ft3"
+) -> dict[str, float]:
     rows = {}
     prefixes = sorted(
         key[: -len("_sse")]
@@ -63,10 +65,14 @@ def finalize_metrics(sums: dict[str, float]) -> dict[str, float]:
         target_sse = sums.get(f"{prefix}_target_sse", 0.0)
         rmse_value = (sse / count) ** 0.5
         target_rms_value = (target_sse / count) ** 0.5
-        rows[f"{prefix}_rmse_ft3"] = rmse_value
-        rows[f"{prefix}_mae_ft3"] = sums.get(f"{prefix}_abs_sum", 0.0) / count
-        rows[f"{prefix}_bias_ft3"] = sums.get(f"{prefix}_sum", 0.0) / count
-        rows[f"{prefix}_target_rms_ft3"] = target_rms_value
+        rows[f"{prefix}_rmse_{volume_unit_suffix}"] = rmse_value
+        rows[f"{prefix}_mae_{volume_unit_suffix}"] = (
+            sums.get(f"{prefix}_abs_sum", 0.0) / count
+        )
+        rows[f"{prefix}_bias_{volume_unit_suffix}"] = (
+            sums.get(f"{prefix}_sum", 0.0) / count
+        )
+        rows[f"{prefix}_target_rms_{volume_unit_suffix}"] = target_rms_value
         rows[f"{prefix}_relative_rmse"] = rmse_value / max(target_rms_value, 1e-12)
     for key, value in sums.items():
         if not key.endswith(("_sse", "_target_sse", "_abs_sum", "_sum", "_count")):

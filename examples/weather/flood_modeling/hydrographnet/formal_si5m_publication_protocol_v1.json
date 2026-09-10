@@ -1,0 +1,174 @@
+{
+  "protocol": "MINXIONG_HGN_SELECTIVE_EDGE_SI5M_V1",
+  "created_at": "2026-09-09T00:00:00+08:00",
+  "status": "pre_outcome_design_frozen_pending_complete_dataset",
+  "research_scope": {
+    "backbone": "NVIDIA HydroGraphNet MeshGraphKAN",
+    "contribution": "edge-informed connected-control-volume conservation applied only to a collaborator-supplied high-fidelity zone",
+    "zoning_algorithm_is_contribution": false,
+    "high_zone_code": 3,
+    "dualfloodgnn_role": "external same-dataset benchmark only"
+  },
+  "data_contract": {
+    "project": "Minxiong native-SI HEC-RAS 6.6",
+    "event_ids": "H1-H100",
+    "event_count": 100,
+    "hydraulic_units": "SI",
+    "model_output_interval_seconds": 300,
+    "internal_solver_step_seconds": 10,
+    "difficult_event_retry_steps_seconds": [5, 2],
+    "retry_invariant": "Only the maximum internal solver step may decrease; forcing, geometry, five-minute output, split, and quality thresholds remain unchanged.",
+    "dynamic_warmup_steps": 288,
+    "dynamic_warmup_hours": 24,
+    "post_peak_steps": 100,
+    "split_manifest_sha256": "6c4e2c1929730a80593170d3fea9aef47fc76398a9a3166acb3bf72009392f3c",
+    "split_counts": {
+      "train": 70,
+      "validation": 15,
+      "test": 15
+    },
+    "test_outcomes_sealed_during_development": true,
+    "event_diversity_required": true,
+    "node_precipitation_source": "pre-simulation raster values and cell weights",
+    "future_hecras_outputs_allowed_at_inference": false
+  },
+  "target_contract": {
+    "face_target": "HEC-RAS Face Flow Period Average multiplied by the exact 300-second interval",
+    "edge_target_projection": "minimum-L2 correction of native internal face volumes to match HGN storage change minus known raster precipitation and omitted boundary-face divergence",
+    "empirical_scale_factor_allowed": false,
+    "cell_only_control": "period-average face divergence plus known raster precipitation collapsed to per-cell net budget; edge values are not exposed to the model",
+    "direct_five_minute_cell_flow_balance_integration_allowed": false,
+    "direct_cell_balance_reason": "Cell Flow Balance is a point output, whereas Face Flow Period Average is interval-resolved and matches the five-minute model transition.",
+    "conservation_scope": "127 connected high-fidelity interior control volumes; external-boundary nodes excluded",
+    "exact_projected_closure_is_by_construction": true
+  },
+  "required_methods": [
+    {
+      "id": "hgn_native_si5m",
+      "role": "primary no-edge baseline",
+      "definition": "HydroGraphNet architecture and original graph-level physics objective with only the documented SI/time/data adapters"
+    },
+    {
+      "id": "official_hgn_20min_compatibility",
+      "role": "untouched-code reproduction check",
+      "definition": "Unmodified NVIDIA loader on a deterministic 20-minute compatibility view; compare proposed and no-edge methods on the same view and label separately from the native five-minute experiment"
+    },
+    {
+      "id": "hgn_cell_budget_high",
+      "role": "cell-only local-conservation control",
+      "definition": "High-zone per-cell net budget supervision without learned edge output"
+    },
+    {
+      "id": "hgn_selective_face_only",
+      "role": "learned-edge control",
+      "definition": "Selective physical-face head with Face Flow supervision but no hard projection or conservative state feedback"
+    },
+    {
+      "id": "hgn_selective_hard_staged",
+      "role": "staged control",
+      "definition": "Frozen trained HGN backbone plus selective edge head and exact connected-control-volume projection"
+    },
+    {
+      "id": "hgn_selective_hard_end_to_end",
+      "role": "proposed candidate",
+      "definition": "Joint HGN node and selective edge-head training through differentiable exact connected-control-volume projection"
+    },
+    {
+      "id": "hgn_all_edge_face_only",
+      "role": "full-edge scope and runtime control",
+      "definition": "The same HGN edge head evaluated on every internal face"
+    },
+    {
+      "id": "adapted_dualfloodgnn",
+      "role": "external benchmark",
+      "definition": "DUALFloodGNN adapted to the same graph, variables, split, forcing, horizon, hardware, and timing protocol; never used as the proposed backbone"
+    }
+  ],
+  "development_selection": {
+    "screening_seed": 0,
+    "screening_epochs": 10,
+    "screening_max_batches_per_epoch": 500,
+    "full_training_epochs": 30,
+    "full_training_max_batches_per_epoch": 1000,
+    "final_seeds": [0, 1, 2],
+    "checkpoint_evaluation_interval_epochs": 5,
+    "cell_loss_weight_grid": [0.01, 0.03, 0.1, 0.3],
+    "face_only_loss_weight_grid": [0.01, 0.03, 0.1, 0.3],
+    "hard_outer_loss_weight_grid": [0.03, 0.1, 0.3],
+    "hard_raw_control_volume_weight_grid": [0.0, 0.01, 0.03, 0.1],
+    "selection_split": "validation only",
+    "selection_priority": [
+      "high-zone depth RMSE",
+      "all-domain depth RMSE non-inferiority",
+      "raw learned-edge Face Flow RMSE",
+      "raw connected-control-volume residual",
+      "runtime"
+    ],
+    "test_use": "one pass only after method, checkpoint, seeds, thresholds, code hashes, and statistics are frozen"
+  },
+  "forecast_protocol": {
+    "rollout_steps": 96,
+    "rollout_minutes": 480,
+    "wet_depth_threshold_m": 0.01,
+    "primary_metrics": [
+      "high_depth_rmse_m",
+      "all_depth_rmse_m"
+    ],
+    "secondary_metrics": [
+      "high_peak_depth_rmse_m",
+      "high_arrival_time_mae_minutes",
+      "high_wet_f1",
+      "all_total_volume_rmse_m3"
+    ]
+  },
+  "claim_gates": {
+    "forecast": {
+      "high_depth_rmse_proposed_vs_hgn_ratio_max": 1.0,
+      "all_depth_rmse_proposed_vs_hgn_ratio_max": 1.02,
+      "paired_bootstrap_required": true
+    },
+    "learned_edge_utility": {
+      "raw_face_rmse_must_beat_zero_flow": true,
+      "raw_face_rmse_must_beat_surface_gradient_heuristic": true,
+      "projection_correction_must_be_reported": true
+    },
+    "conservation": {
+      "projected_connected_cv_relative_rmse_max": 0.0001,
+      "raw_connected_cv_residual_must_improve_over_hgn": true,
+      "projected_exact_closure_alone_is_not_sufficient_for_claim": true
+    },
+    "efficiency": {
+      "same_gpu_software_workload_required": true,
+      "minimum_timing_repeats": 20,
+      "proposed_complete_latency_must_be_below_adapted_dual": true,
+      "hgn_overhead_must_be_reported_not_hidden": true,
+      "required_metrics": [
+        "parameter_count",
+        "active_face_fraction",
+        "node_latency",
+        "edge_head_latency",
+        "projection_latency",
+        "complete_event_latency",
+        "peak_gpu_memory"
+      ]
+    }
+  },
+  "statistics": {
+    "unit_of_pairing": "event within seed",
+    "minimum_final_seeds": 3,
+    "confidence_interval": 0.95,
+    "bootstrap_resamples": 10000,
+    "negative_results_retained": true,
+    "no_gate_relaxation_after_validation_or_test_outcomes": true
+  },
+  "publication_claim_boundary": {
+    "allowed_if_all_gates_pass": "HydroGraphNet-based selective physical-edge local conservation improves high-zone forecasting and raw local budget consistency with lower complete inference cost than an adapted full-edge DUALFloodGNN benchmark on the same Minxiong dataset.",
+    "not_allowed_without_additional_evidence": [
+      "better than all existing flood GNNs",
+      "strict node-level conservation",
+      "automatic zoning algorithm contribution",
+      "faster than no-edge HydroGraphNet",
+      "forecast improvement inferred only from exact projected closure"
+    ]
+  }
+}

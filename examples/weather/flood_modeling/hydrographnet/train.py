@@ -39,6 +39,12 @@ from physicsnemo.utils.logging import PythonLogger, RankZeroLoggingWrapper
 from physicsnemo.utils.logging.wandb import initialize_wandb
 from physicsnemo.utils import load_checkpoint, save_checkpoint
 from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
+from selective_hard_conservation_training import (
+    compute_selective_hard_conservation_loss,
+    projected_volume_feedback_delta,
+    refresh_rollout_graph_state,
+    update_hgn_rollout_state,
+)
 from utils import (
     compute_edge_local_proxy_loss,
     compute_hecras_cell_balance_loss,
@@ -82,7 +88,9 @@ class HecRasEdgeFluxHead(nn.Module):
         use_physical_surface_features: bool = False,
         use_previous_face_flow: bool = False,
         use_edge_physical_features: bool = False,
+        use_node_prediction_features: bool = False,
         output_mode: str = "raw",
+        active_face_mode: str = "all",
     ):
         super().__init__()
         self.scale = scale
@@ -92,7 +100,19 @@ class HecRasEdgeFluxHead(nn.Module):
         self.use_physical_surface_features = use_physical_surface_features
         self.use_previous_face_flow = use_previous_face_flow
         self.use_edge_physical_features = use_edge_physical_features
+        self.use_node_prediction_features = use_node_prediction_features
         self.output_mode = output_mode
+        self.active_face_mode = active_face_mode
+        allowed_active_face_modes = {
+            "all",
+            "zone4_touch",
+            "high_interior_touch",
+        }
+        if active_face_mode not in allowed_active_face_modes:
+            raise ValueError(
+                "active_face_mode must be one of "
+                f"{sorted(allowed_active_face_modes)}, got {active_face_mode!r}."
+            )
         allowed_output_modes = {
             "raw",
             "per_face_rms",
@@ -124,6 +144,7 @@ class HecRasEdgeFluxHead(nn.Module):
             + (4 if use_physical_surface_features else 0)
             + (2 if use_previous_face_flow else 0)
             + (12 if use_edge_physical_features else 0)
+            + (4 if use_node_prediction_features else 0)
         )
         if num_hidden_layers < 1:
             raise ValueError("num_hidden_layers must be at least 1.")
@@ -133,21 +154,161 @@ class HecRasEdgeFluxHead(nn.Module):
         layers.append(nn.Linear(hidden_dim, 1))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, graph):
+    @staticmethod
+    def _group_index_and_count(graph, item_index=None):
+        """Return graph IDs so feature scaling is invariant to batch makeup."""
+        batch = getattr(graph, "batch", None)
+        if batch is None:
+            return None, 1
+        group_index = batch if item_index is None else batch[item_index]
+        ptr = getattr(graph, "ptr", None)
+        if ptr is not None:
+            num_groups = int(ptr.numel() - 1)
+        else:
+            num_groups = int(batch.max().detach().item()) + 1
+        return group_index.to(graph.x.device), num_groups
+
+    @staticmethod
+    def _group_rms_scale(values, group_index, num_groups, minimum):
+        detached = values.detach()
+        if group_index is None:
+            return torch.clamp(
+                torch.sqrt(torch.mean(detached.square(), dim=0, keepdim=True)),
+                min=minimum,
+            )
+        squared_sum = torch.zeros(
+            (num_groups, values.shape[1]),
+            dtype=values.dtype,
+            device=values.device,
+        )
+        counts = torch.zeros(
+            (num_groups, 1), dtype=values.dtype, device=values.device
+        )
+        squared_sum.index_add_(0, group_index, detached.square())
+        counts.index_add_(
+            0,
+            group_index,
+            torch.ones((values.shape[0], 1), dtype=values.dtype, device=values.device),
+        )
+        scale = torch.sqrt(squared_sum / torch.clamp(counts, min=1.0))
+        return torch.clamp(scale[group_index], min=minimum)
+
+    @staticmethod
+    def _group_mean_scale(values, group_index, num_groups, minimum):
+        detached = values.detach()
+        if group_index is None:
+            return torch.clamp(detached.mean(dim=0, keepdim=True), min=minimum)
+        value_sum = torch.zeros(
+            (num_groups, values.shape[1]),
+            dtype=values.dtype,
+            device=values.device,
+        )
+        counts = torch.zeros(
+            (num_groups, 1), dtype=values.dtype, device=values.device
+        )
+        value_sum.index_add_(0, group_index, detached)
+        counts.index_add_(
+            0,
+            group_index,
+            torch.ones((values.shape[0], 1), dtype=values.dtype, device=values.device),
+        )
+        scale = value_sum / torch.clamp(counts, min=1.0)
+        return torch.clamp(scale[group_index], min=minimum)
+
+    @staticmethod
+    def _group_standardize(values, group_index, num_groups, minimum=1e-6):
+        detached = values.detach()
+        if group_index is None:
+            mean = detached.mean(dim=0, keepdim=True)
+            std = detached.std(dim=0, unbiased=False, keepdim=True)
+            return (values - mean) / torch.clamp(std, min=minimum)
+        value_sum = torch.zeros(
+            (num_groups, values.shape[1]),
+            dtype=values.dtype,
+            device=values.device,
+        )
+        squared_sum = torch.zeros_like(value_sum)
+        counts = torch.zeros(
+            (num_groups, 1), dtype=values.dtype, device=values.device
+        )
+        value_sum.index_add_(0, group_index, detached)
+        squared_sum.index_add_(0, group_index, detached.square())
+        counts.index_add_(
+            0,
+            group_index,
+            torch.ones((values.shape[0], 1), dtype=values.dtype, device=values.device),
+        )
+        counts = torch.clamp(counts, min=1.0)
+        mean = value_sum / counts
+        variance = torch.clamp(squared_sum / counts - mean.square(), min=0.0)
+        std = torch.sqrt(variance)
+        return (values - mean[group_index]) / torch.clamp(
+            std[group_index], min=minimum
+        )
+
+    def active_face_mask(self, graph) -> torch.Tensor:
+        """Select only faces needed by the declared conservation scope."""
+        src, dst = graph.hecras_face_index
+        if self.active_face_mode == "all":
+            return torch.ones(src.shape[0], dtype=torch.bool, device=src.device)
+        if self.active_face_mode == "zone4_touch":
+            if not hasattr(graph, "zone_label"):
+                raise AttributeError(
+                    "active_face_mode='zone4_touch' requires graph.zone_label."
+                )
+            labels = graph.zone_label.to(src.device)
+            return (labels[src] == 3) | (labels[dst] == 3)
+        if self.active_face_mode == "high_interior_touch":
+            if not hasattr(graph, "hecras_high_interior_control_volume_label"):
+                raise AttributeError(
+                    "active_face_mode='high_interior_touch' requires "
+                    "graph.hecras_high_interior_control_volume_label."
+                )
+            labels = graph.hecras_high_interior_control_volume_label.to(src.device)
+            return (labels[src] >= 0) | (labels[dst] >= 0)
+        raise RuntimeError(f"Unhandled active_face_mode: {self.active_face_mode!r}")
+
+    def forward(self, graph, node_prediction=None):
         face_index = graph.hecras_face_index
-        src, dst = face_index
-        if src.numel() == 0:
+        full_src, full_dst = face_index
+        if full_src.numel() == 0:
             return graph.x.new_zeros((0,))
-        face_length = graph.hecras_face_length.to(graph.x.device).reshape(-1, 1)
-        face_length_scale = torch.clamp(torch.mean(face_length.detach()), min=1.0)
+        active_mask = self.active_face_mask(graph)
+        active_indices = torch.nonzero(active_mask, as_tuple=False).reshape(-1)
+        if active_indices.numel() == 0:
+            return graph.x.new_zeros((full_src.shape[0],))
+        src = full_src[active_mask]
+        dst = full_dst[active_mask]
+        face_length = graph.hecras_face_length.to(graph.x.device).reshape(-1, 1)[
+            active_mask
+        ]
+        face_group, num_groups = self._group_index_and_count(graph, src)
+        node_group, _ = self._group_index_and_count(graph)
+        face_length_scale = self._group_mean_scale(
+            face_length, face_group, num_groups, minimum=1.0
+        )
         features = [graph.x[src], graph.x[dst], face_length / face_length_scale]
+        if self.use_node_prediction_features:
+            if node_prediction is None:
+                raise ValueError(
+                    "HecRasEdgeFluxHead(use_node_prediction_features=True) "
+                    "requires the HydroGraphNet node prediction."
+                )
+            if node_prediction.shape != (graph.x.shape[0], 2):
+                raise ValueError(
+                    "node_prediction must have shape (num_nodes, 2), got "
+                    f"{tuple(node_prediction.shape)}."
+                )
+            features.extend([node_prediction[src], node_prediction[dst]])
         if self.use_face_normal:
             if not hasattr(graph, "hecras_face_normal"):
                 raise AttributeError(
                     "HecRasEdgeFluxHead(use_face_normal=True) requires "
                     "graph.hecras_face_normal."
                 )
-            features.append(graph.hecras_face_normal.to(graph.x.device))
+            features.append(
+                graph.hecras_face_normal.to(graph.x.device)[active_mask]
+            )
         if self.use_surface_features:
             latest_wd = graph.x[:, 13:14]
             latest_volume = graph.x[:, 15:16]
@@ -158,8 +319,8 @@ class HecRasEdgeFluxHead(nn.Module):
                 torch.zeros(graph.x.shape[0], device=graph.x.device),
             )
             source_rate = source_rate.to(graph.x.device).reshape(-1, 1)
-            source_scale = torch.clamp(
-                torch.sqrt(torch.mean(source_rate.detach() ** 2)), min=1.0
+            source_scale = self._group_rms_scale(
+                source_rate, node_group, num_groups, minimum=1.0
             )
             source_rate = source_rate / source_scale
             features.extend(
@@ -183,11 +344,11 @@ class HecRasEdgeFluxHead(nn.Module):
             length_scale = torch.clamp(face_length, min=1.0)
             surface_slope = (surface[dst] - surface[src]) / length_scale
             depth_slope = (depth[dst] - depth[src]) / length_scale
-            surface_slope = surface_slope / torch.clamp(
-                torch.sqrt(torch.mean(surface_slope.detach() ** 2)), min=1e-6
+            surface_slope = surface_slope / self._group_rms_scale(
+                surface_slope, face_group, num_groups, minimum=1e-6
             )
-            depth_slope = depth_slope / torch.clamp(
-                torch.sqrt(torch.mean(depth_slope.detach() ** 2)), min=1e-6
+            depth_slope = depth_slope / self._group_rms_scale(
+                depth_slope, face_group, num_groups, minimum=1e-6
             )
             features.extend(
                 [
@@ -205,12 +366,12 @@ class HecRasEdgeFluxHead(nn.Module):
                 )
             previous_flow = graph.hecras_previous_internal_face_flow_delta.to(
                 graph.x.device
-            ).reshape(-1, 1)
+            ).reshape(-1, 1)[active_mask]
             if hasattr(graph, "hecras_internal_face_flow_rms"):
                 previous_scale = torch.clamp(
                     graph.hecras_internal_face_flow_rms.to(graph.x.device).reshape(
                         -1, 1
-                    ),
+                    )[active_mask],
                     min=1.0,
                 )
             else:
@@ -225,35 +386,45 @@ class HecRasEdgeFluxHead(nn.Module):
                     "HecRasEdgeFluxHead(use_edge_physical_features=True) "
                     "requires graph.hecras_edge_physical_features."
                 )
-            physical_features = graph.hecras_edge_physical_features.to(graph.x.device)
+            physical_features = graph.hecras_edge_physical_features.to(
+                graph.x.device
+            )[active_mask]
             if physical_features.shape[1] != 12:
                 raise ValueError(
                     "graph.hecras_edge_physical_features must have 12 columns, "
                     f"got {physical_features.shape}."
                 )
-            feature_mean = physical_features.mean(dim=0, keepdim=True)
-            feature_std = torch.clamp(
-                physical_features.std(dim=0, unbiased=False, keepdim=True),
-                min=1e-6,
+            features.append(
+                self._group_standardize(
+                    physical_features, face_group, num_groups
+                )
             )
-            features.append((physical_features - feature_mean) / feature_std)
         head_input = torch.cat(features, dim=1)
         output = self.net(head_input).reshape(-1) * self.scale
         if self.output_mode == "raw":
-            return output
-        face_scale = self._resolve_output_scale(graph, output)
-        if not (
+            active_output = output
+        else:
+            face_scale = self._resolve_output_scale(graph, output, active_mask)
+            active_output = output * face_scale
+        if self.output_mode != "raw" and (
             self.output_mode.startswith("asinh_")
             or self.output_mode.startswith("signed_log1p_")
         ):
-            return output * face_scale
-        if self.output_mode.startswith("asinh_"):
-            return torch.sinh(torch.clamp(output, min=-20.0, max=20.0)) * face_scale
-        if self.output_mode.startswith("signed_log1p_"):
-            return torch.sign(output) * torch.expm1(torch.abs(output)) * face_scale
-        raise RuntimeError(f"Unhandled output_mode: {self.output_mode!r}")
+            if self.output_mode.startswith("asinh_"):
+                active_output = (
+                    torch.sinh(torch.clamp(output, min=-20.0, max=20.0))
+                    * face_scale
+                )
+            else:
+                active_output = (
+                    torch.sign(output) * torch.expm1(torch.abs(output)) * face_scale
+                )
+        full_output = output.new_zeros((full_src.shape[0],))
+        return full_output.index_copy(0, active_indices, active_output)
 
-    def _resolve_output_scale(self, graph, output: torch.Tensor) -> torch.Tensor:
+    def _resolve_output_scale(
+        self, graph, output: torch.Tensor, active_mask=None
+    ) -> torch.Tensor:
         mode = self.output_mode
         for prefix in ("asinh_", "signed_log1p_"):
             if mode.startswith(prefix):
@@ -272,6 +443,8 @@ class HecRasEdgeFluxHead(nn.Module):
                 graph.hecras_internal_face_flow_rms.to(device).reshape(-1),
                 min=1.0,
             ).to(dtype)
+            if active_mask is not None:
+                face_scale = face_scale[active_mask]
         if mode == "per_face_rms":
             return face_scale
         if mode in {"event_rms", "face_event_rms"}:
@@ -325,6 +498,7 @@ class MGNTrainer:
         self.dist = DistributedManager()
         self.amp = cfg.amp
         self.noise_type = cfg.noise_type
+        self.n_time_steps = int(cfg.n_time_steps)
 
         # Physics loss settings.
         self.use_physics_loss = cfg.get("use_physics_loss", False)
@@ -365,6 +539,9 @@ class MGNTrainer:
         self.hecras_cell_balance_zone_mode = cfg.get(
             "hecras_cell_balance_zone_mode", "zone_weight"
         )
+        self.hecras_cell_balance_loss_normalization = cfg.get(
+            "hecras_cell_balance_loss_normalization", "none"
+        )
         self.use_hecras_edge_flow_loss = cfg.get(
             "use_hecras_edge_flow_loss", False
         )
@@ -398,8 +575,21 @@ class MGNTrainer:
         self.hecras_edge_flux_head_face_target_weight = cfg.get(
             "hecras_edge_flux_head_face_target_weight", 0.0
         )
+        self.hecras_edge_flux_head_face_zone_mode = cfg.get(
+            "hecras_edge_flux_head_face_zone_mode",
+            self.hecras_edge_flux_head_zone_mode,
+        )
         self.hecras_edge_flux_head_face_loss_normalization = cfg.get(
             "hecras_edge_flux_head_face_loss_normalization", "none"
+        )
+        self.hecras_edge_flux_head_node_loss_normalization = cfg.get(
+            "hecras_edge_flux_head_node_loss_normalization", "none"
+        )
+        self.hecras_edge_flux_head_storage_delta_mode = cfg.get(
+            "hecras_edge_flux_head_storage_delta_mode", "dataset_volume"
+        )
+        self.hecras_edge_flux_head_closure_granularity = cfg.get(
+            "hecras_edge_flux_head_closure_granularity", "node"
         )
         self.hecras_edge_flux_head_hidden_dim = cfg.get(
             "hecras_edge_flux_head_hidden_dim", 128
@@ -422,9 +612,96 @@ class MGNTrainer:
         self.hecras_edge_flux_head_use_edge_physical_features = cfg.get(
             "hecras_edge_flux_head_use_edge_physical_features", False
         )
+        self.hecras_edge_flux_head_use_node_prediction_features = cfg.get(
+            "hecras_edge_flux_head_use_node_prediction_features", False
+        )
         self.hecras_edge_flux_head_output_mode = cfg.get(
             "hecras_edge_flux_head_output_mode", "raw"
         )
+        self.hecras_edge_flux_head_active_face_mode = cfg.get(
+            "hecras_edge_flux_head_active_face_mode", "all"
+        )
+        self.use_selective_hard_conservation = cfg.get(
+            "use_selective_hard_conservation", False
+        )
+        self.selective_hard_conservation_loss_weight = cfg.get(
+            "selective_hard_conservation_loss_weight", 0.0
+        )
+        self.selective_hard_conservation_raw_control_volume_weight = cfg.get(
+            "selective_hard_conservation_raw_control_volume_weight", 0.0
+        )
+        self.selective_hard_conservation_correction_weight_mode = cfg.get(
+            "selective_hard_conservation_correction_weight_mode",
+            "training_face_rms_squared",
+        )
+        self.selective_hard_conservation_face_loss_normalization = cfg.get(
+            "selective_hard_conservation_face_loss_normalization",
+            "asinh_per_face_rms",
+        )
+        self.selective_hard_conservation_node_loss_normalization = cfg.get(
+            "selective_hard_conservation_node_loss_normalization", "volume_std"
+        )
+        self.training_rollout_steps = int(cfg.get("training_rollout_steps", 1))
+        self.training_rollout_discount = float(
+            cfg.get("training_rollout_discount", 1.0)
+        )
+        self.training_rollout_backprop_through_time = bool(
+            cfg.get("training_rollout_backprop_through_time", True)
+        )
+        self.training_rollout_volume_feedback = cfg.get(
+            "training_rollout_volume_feedback", "node"
+        )
+        self.training_rollout_projected_volume_alpha = float(
+            cfg.get("training_rollout_projected_volume_alpha", 1.0)
+        )
+        if self.training_rollout_steps < 1:
+            raise ValueError("training_rollout_steps must be positive.")
+        if not 0.0 < self.training_rollout_discount <= 1.0:
+            raise ValueError("training_rollout_discount must be in (0, 1].")
+        if self.training_rollout_volume_feedback not in {
+            "node",
+            "selective_projected",
+        }:
+            raise ValueError(
+                "training_rollout_volume_feedback must be 'node' or "
+                "'selective_projected'."
+            )
+        if not 0.0 <= self.training_rollout_projected_volume_alpha <= 1.0:
+            raise ValueError(
+                "training_rollout_projected_volume_alpha must be in [0, 1]."
+            )
+        if self.training_rollout_steps > 1:
+            if cfg.batch_size != 1:
+                raise ValueError(
+                    "Differentiable training rollouts currently require batch_size=1."
+                )
+            if self.noise_type == "pushforward":
+                raise ValueError(
+                    "training_rollout_steps>1 cannot use legacy pushforward noise."
+                )
+            unsupported = {
+                "edge_local_proxy": self.use_edge_local_proxy,
+                "legacy_face": self.use_hecras_face_loss,
+                "face_geometry": self.use_hecras_face_geometry_loss,
+                "cell_balance": self.use_hecras_cell_balance_loss,
+                "legacy_edge_flow": self.use_hecras_edge_flow_loss,
+                "soft_edge_flux": self.hecras_edge_flux_head_loss_weight > 0,
+            }
+            enabled = [name for name, active in unsupported.items() if active]
+            if enabled:
+                raise ValueError(
+                    "Differentiable training rollouts intentionally support only "
+                    "the HGN objective and selective hard edge objective; disable: "
+                    + ", ".join(enabled)
+                )
+            if (
+                self.training_rollout_volume_feedback == "selective_projected"
+                and not self.use_selective_hard_conservation
+            ):
+                raise ValueError(
+                    "selective_projected training feedback requires "
+                    "use_selective_hard_conservation=true."
+                )
 
         # Set activation function.
         mlp_act = "relu"
@@ -469,6 +746,17 @@ class MGNTrainer:
             hecras_face_time_offset=cfg.get("hecras_face_time_offset", 0),
             return_hecras_cell_balance=self.use_hecras_cell_balance_loss,
             hecras_cell_balance_glob=cfg.get("hecras_cell_balance_glob"),
+            hecras_cell_balance_npz=cfg.get("hecras_cell_balance_npz"),
+            hecras_cell_balance_target_dir=cfg.get(
+                "hecras_cell_balance_target_dir"
+            ),
+            hecras_cell_balance_npz_key_suffix=cfg.get(
+                "hecras_cell_balance_npz_key_suffix",
+                "_cell_balance_storage_delta",
+            ),
+            hecras_cell_balance_time_offset=cfg.get(
+                "hecras_cell_balance_time_offset"
+            ),
             hecras_cell_balance_path=cfg.get(
                 "hecras_cell_balance_path",
                 (
@@ -503,6 +791,9 @@ class MGNTrainer:
                 self.use_hecras_edge_flow_loss or self.use_hecras_edge_flux_head
             ),
             hecras_edge_flow_npz=cfg.get("hecras_edge_flow_npz"),
+            hecras_conservative_edge_target_dir=cfg.get(
+                "hecras_conservative_edge_target_dir"
+            ),
             hecras_edge_flow_mode=cfg.get("hecras_edge_flow_mode", "all_touching"),
             hecras_edge_flow_face_stats_npz=cfg.get(
                 "hecras_edge_flow_face_stats_npz"
@@ -510,6 +801,19 @@ class MGNTrainer:
             hecras_edge_flow_scale_stats_npz=cfg.get(
                 "hecras_edge_flow_scale_stats_npz"
             ),
+            precipitation_unit_conversion=cfg.get(
+                "precipitation_unit_conversion", 2.7778e-7
+            ),
+            local_source_runoff_mode=cfg.get(
+                "local_source_runoff_mode", "ip_fraction"
+            ),
+            require_node_precipitation=cfg.get(
+                "require_node_precipitation", False
+            ),
+            hecras_edge_flow_time_offset=cfg.get("hecras_edge_flow_time_offset", 0),
+            dynamic_skip_steps=cfg.get("dynamic_skip_steps"),
+            post_peak_steps=cfg.get("post_peak_steps"),
+            training_rollout_steps=self.training_rollout_steps,
         )
         sampler = DistributedSampler(
             dataset,
@@ -546,6 +850,20 @@ class MGNTrainer:
             self.model = self.model.to(self.dist.device)
         rank_zero_logger.info("Model instantiated successfully.")
 
+        init_mesh_checkpoint_path = cfg.get("init_mesh_checkpoint_path")
+        if init_mesh_checkpoint_path:
+            init_mesh_epoch = cfg.get("init_mesh_checkpoint_epoch")
+            loaded_init_mesh_epoch = load_checkpoint(
+                to_absolute_path(init_mesh_checkpoint_path),
+                models=self.model,
+                epoch=init_mesh_epoch,
+                device=self.dist.device,
+            )
+            rank_zero_logger.info(
+                f"Initialized MeshGraphKAN from {init_mesh_checkpoint_path} "
+                f"at epoch {loaded_init_mesh_epoch}."
+            )
+
         self.edge_flux_head = None
         if self.use_hecras_edge_flux_head:
             rank_zero_logger.info("Instantiating HEC-RAS edge-flux head...")
@@ -567,7 +885,11 @@ class MGNTrainer:
                 use_edge_physical_features=(
                     self.hecras_edge_flux_head_use_edge_physical_features
                 ),
+                use_node_prediction_features=(
+                    self.hecras_edge_flux_head_use_node_prediction_features
+                ),
                 output_mode=self.hecras_edge_flux_head_output_mode,
+                active_face_mode=self.hecras_edge_flux_head_active_face_mode,
             ).to(self.dist.device)
             rank_zero_logger.info("HEC-RAS edge-flux head instantiated successfully.")
 
@@ -603,6 +925,19 @@ class MGNTrainer:
             raise ValueError(
                 "freeze_mesh_model_for_edge_flux_head requires "
                 "use_hecras_edge_flux_head=true"
+            )
+        if self.use_selective_hard_conservation and self.edge_flux_head is None:
+            raise ValueError(
+                "use_selective_hard_conservation requires "
+                "use_hecras_edge_flux_head=true"
+            )
+        if (
+            self.use_selective_hard_conservation
+            and self.selective_hard_conservation_loss_weight <= 0
+        ):
+            raise ValueError(
+                "use_selective_hard_conservation requires a positive "
+                "selective_hard_conservation_loss_weight"
             )
         if self.freeze_mesh_model_for_edge_flux_head:
             rank_zero_logger.info(
@@ -672,7 +1007,271 @@ class MGNTrainer:
         self.scheduler.step()
         return loss, loss_dict
 
+    def add_edge_flux_objectives(self, pred, graph, loss, loss_dict):
+        """Add optional soft and exact selective edge-flux objectives."""
+        use_soft = (
+            self.edge_flux_head is not None
+            and self.hecras_edge_flux_head_loss_weight > 0
+        )
+        use_hard = (
+            self.edge_flux_head is not None
+            and self.use_selective_hard_conservation
+            and self.selective_hard_conservation_loss_weight > 0
+        )
+        if not (use_soft or use_hard):
+            return loss, loss_dict, None
+
+        raw_edge_flux = self.edge_flux_head(graph, pred)
+        if use_soft:
+            edge_flux_loss, edge_flux_metrics = compute_hecras_edge_flux_head_loss(
+                pred,
+                raw_edge_flux,
+                graph,
+                zone_mode=self.hecras_edge_flux_head_zone_mode,
+                zone_high_weight=self.hecras_edge_flux_head_zone_high_weight,
+                zone_low_weight=self.hecras_edge_flux_head_zone_low_weight,
+                closure_target_weight=(
+                    self.hecras_edge_flux_head_closure_target_weight
+                ),
+                divergence_target_weight=(
+                    self.hecras_edge_flux_head_divergence_target_weight
+                ),
+                face_target_weight=self.hecras_edge_flux_head_face_target_weight,
+                face_zone_mode=self.hecras_edge_flux_head_face_zone_mode,
+                face_loss_normalization=(
+                    self.hecras_edge_flux_head_face_loss_normalization
+                ),
+                node_loss_normalization=(
+                    self.hecras_edge_flux_head_node_loss_normalization
+                ),
+                storage_delta_mode=self.hecras_edge_flux_head_storage_delta_mode,
+                closure_granularity=(
+                    self.hecras_edge_flux_head_closure_granularity
+                ),
+                delta_t=self.delta_t,
+            )
+            loss = loss + self.hecras_edge_flux_head_loss_weight * edge_flux_loss
+            loss_dict["hecras_edge_flux_head_loss"] = edge_flux_loss
+            loss_dict.update(edge_flux_metrics)
+
+        hard_result = None
+        if use_hard:
+            hard_result = compute_selective_hard_conservation_loss(
+                pred,
+                raw_edge_flux,
+                graph,
+                delta_t=self.delta_t,
+                raw_control_volume_weight=(
+                    self.selective_hard_conservation_raw_control_volume_weight
+                ),
+                correction_weight_mode=(
+                    self.selective_hard_conservation_correction_weight_mode
+                ),
+                face_loss_normalization=(
+                    self.selective_hard_conservation_face_loss_normalization
+                ),
+                node_loss_normalization=(
+                    self.selective_hard_conservation_node_loss_normalization
+                ),
+            )
+            loss = (
+                loss
+                + self.selective_hard_conservation_loss_weight * hard_result.loss
+            )
+            loss_dict["selective_hard_conservation_loss"] = hard_result.loss
+            loss_dict["selective_hard_projected_face_loss"] = (
+                hard_result.projected_face_loss
+            )
+            loss_dict["selective_hard_raw_control_volume_loss"] = (
+                hard_result.raw_control_volume_loss
+            )
+            loss_dict["selective_hard_projection_correction_rms"] = torch.sqrt(
+                torch.mean(hard_result.projection.face_correction.square())
+            )
+            loss_dict["selective_hard_projected_closure_rms"] = torch.sqrt(
+                torch.mean(
+                    hard_result.projection.projected_component_residual.square()
+                )
+            )
+        return loss, loss_dict, hard_result
+
+    def _set_training_rollout_step_attrs(self, graph, step):
+        """Select one time column from the dataset's rollout sidecars."""
+
+        local_source = graph.training_rollout_local_source_rate[:, step]
+        refresh_rollout_graph_state(
+            graph,
+            graph.x,
+            local_source,
+            n_time_steps=self.n_time_steps,
+        )
+        if self.edge_flux_head is None:
+            return
+
+        required = (
+            "training_rollout_edge_internal_delta",
+            "training_rollout_edge_boundary_source_delta",
+            "training_rollout_edge_precipitation_delta",
+            "training_rollout_internal_face_flow_delta",
+            "training_rollout_previous_internal_face_flow_delta",
+        )
+        missing = [name for name in required if not hasattr(graph, name)]
+        if missing:
+            raise AttributeError(
+                "Edge rollout training requires graph attributes: "
+                + ", ".join(missing)
+            )
+        graph.hecras_edge_internal_delta = (
+            graph.training_rollout_edge_internal_delta[:, step]
+        )
+        graph.hecras_edge_boundary_source_delta = (
+            graph.training_rollout_edge_boundary_source_delta[:, step]
+        )
+        graph.hecras_local_source_delta = (
+            graph.training_rollout_edge_precipitation_delta[:, step]
+        )
+        graph.hecras_edge_flow_delta = (
+            graph.hecras_edge_internal_delta
+            + graph.hecras_edge_boundary_source_delta
+        )
+        graph.hecras_internal_face_flow_delta = (
+            graph.training_rollout_internal_face_flow_delta[:, step]
+        )
+        graph.hecras_previous_internal_face_flow_delta = (
+            graph.training_rollout_previous_internal_face_flow_delta[:, step]
+        )
+        if hasattr(graph, "training_rollout_raw_internal_face_flow_delta"):
+            graph.hecras_raw_internal_face_flow_delta = (
+                graph.training_rollout_raw_internal_face_flow_delta[:, step]
+            )
+        if hasattr(
+            graph, "training_rollout_internal_face_flow_transition_rms"
+        ):
+            graph.hecras_internal_face_flow_transition_rms = (
+                graph.training_rollout_internal_face_flow_transition_rms[:, step]
+            )
+
+    def _forward_differentiable_rollout(self, graph, physics_data):
+        """Train on consecutive predicted states with optional edge feedback."""
+
+        required = (
+            "training_rollout_target_state",
+            "training_rollout_inflow",
+            "training_rollout_precipitation",
+            "training_rollout_local_source_rate",
+        )
+        missing = [name for name in required if not hasattr(graph, name)]
+        if missing:
+            raise AttributeError(
+                "Differentiable rollout training requires graph attributes: "
+                + ", ".join(missing)
+            )
+
+        with autocast(device_type=self.dist.device.type, enabled=self.amp):
+            x_iter = graph.x
+            target_state = graph.training_rollout_target_state
+            if target_state.shape != (
+                graph.x.shape[0],
+                self.training_rollout_steps,
+                2,
+            ):
+                raise ValueError(
+                    "training_rollout_target_state has unexpected shape "
+                    f"{tuple(target_state.shape)}."
+                )
+
+            weighted_loss = x_iter.new_zeros(())
+            weighted_mse = x_iter.new_zeros(())
+            weight_sum = 0.0
+            physics_loss = None
+            loss_dict = {}
+            for step in range(self.training_rollout_steps):
+                graph.x = x_iter
+                self._set_training_rollout_step_attrs(graph, step)
+                depth_window = x_iter[
+                    :, 12 : 12 + self.n_time_steps
+                ]
+                volume_window = x_iter[
+                    :,
+                    12 + self.n_time_steps : 12 + 2 * self.n_time_steps,
+                ]
+                current_state = torch.stack(
+                    (depth_window[:, -1], volume_window[:, -1]), dim=1
+                )
+                desired_delta = target_state[:, step, :] - current_state
+                pred = self.model(x_iter, graph.edge_attr, graph)
+                mse_loss = self.criterion(pred, desired_delta)
+                step_loss = mse_loss
+                step_metrics = {"mse_loss": mse_loss}
+
+                if self.use_fidelity_zones and self.zone_loss_weight > 0:
+                    zone_loss = compute_zone_weighted_loss(
+                        pred, desired_delta, graph
+                    )
+                    step_loss = step_loss + self.zone_loss_weight * zone_loss
+                    step_metrics["zone_loss"] = zone_loss
+
+                step_loss, step_metrics, hard_result = (
+                    self.add_edge_flux_objectives(
+                        pred, graph, step_loss, step_metrics
+                    )
+                )
+                weight = self.training_rollout_discount**step
+                weighted_loss = weighted_loss + weight * step_loss
+                weighted_mse = weighted_mse + weight * mse_loss
+                weight_sum += weight
+
+                if step == 0 and self.use_physics_loss and physics_data is not None:
+                    physics_loss = compute_physics_loss(
+                        pred, physics_data, graph, delta_t=self.delta_t
+                    )
+                if self.log_zone_metrics:
+                    step_metrics.update(
+                        compute_zone_metrics(pred, desired_delta, graph)
+                    )
+                for name, value in step_metrics.items():
+                    loss_dict[f"rollout_step_{step + 1}_{name}"] = value
+
+                if step + 1 == self.training_rollout_steps:
+                    continue
+                volume_delta_override = None
+                if self.training_rollout_volume_feedback == "selective_projected":
+                    if hard_result is None:
+                        raise RuntimeError(
+                            "Selective projected feedback requires an active hard "
+                            "conservation objective."
+                        )
+                    volume_delta_override = projected_volume_feedback_delta(
+                        pred,
+                        hard_result.projection,
+                        graph,
+                        delta_t=self.delta_t,
+                        alpha=self.training_rollout_projected_volume_alpha,
+                    )
+                x_iter = update_hgn_rollout_state(
+                    x_iter,
+                    pred,
+                    n_time_steps=self.n_time_steps,
+                    next_inflow=graph.training_rollout_inflow[:, step],
+                    next_precipitation=(
+                        graph.training_rollout_precipitation[:, step]
+                    ),
+                    volume_delta_override=volume_delta_override,
+                )
+                if not self.training_rollout_backprop_through_time:
+                    x_iter = x_iter.detach()
+
+            loss = weighted_loss / weight_sum
+            loss_dict["mse_loss"] = weighted_mse / weight_sum
+            if physics_loss is not None:
+                loss = loss + self.physics_loss_weight * physics_loss
+                loss_dict["physics_loss"] = physics_loss
+            loss_dict["total_loss"] = loss
+            return loss, loss_dict
+
     def forward(self, graph, physics_data):
+        if self.training_rollout_steps > 1:
+            return self._forward_differentiable_rollout(graph, physics_data)
         if self.noise_type == "pushforward":
             with autocast(device_type=self.dist.device.type, enabled=self.amp):
                 X = graph.x
@@ -759,6 +1358,7 @@ class MGNTrainer:
                         pred_one,
                         graph,
                         zone_mode=self.hecras_cell_balance_zone_mode,
+                        normalization=self.hecras_cell_balance_loss_normalization,
                     )
                     loss = (
                         loss
@@ -781,41 +1381,9 @@ class MGNTrainer:
                         * hecras_edge_flow_loss
                     )
                     loss_dict["hecras_edge_flow_loss"] = hecras_edge_flow_loss
-                if (
-                    self.edge_flux_head is not None
-                    and self.hecras_edge_flux_head_loss_weight > 0
-                ):
-                    edge_flux_delta = self.edge_flux_head(graph)
-                    edge_flux_loss, edge_flux_metrics = compute_hecras_edge_flux_head_loss(
-                        pred_one,
-                        edge_flux_delta,
-                        graph,
-                        zone_mode=self.hecras_edge_flux_head_zone_mode,
-                        zone_high_weight=(
-                            self.hecras_edge_flux_head_zone_high_weight
-                        ),
-                        zone_low_weight=(
-                            self.hecras_edge_flux_head_zone_low_weight
-                        ),
-                        closure_target_weight=(
-                            self.hecras_edge_flux_head_closure_target_weight
-                        ),
-                        divergence_target_weight=(
-                            self.hecras_edge_flux_head_divergence_target_weight
-                        ),
-                        face_target_weight=(
-                            self.hecras_edge_flux_head_face_target_weight
-                        ),
-                        face_loss_normalization=(
-                            self.hecras_edge_flux_head_face_loss_normalization
-                        ),
-                    )
-                    loss = (
-                        loss
-                        + self.hecras_edge_flux_head_loss_weight * edge_flux_loss
-                    )
-                    loss_dict["hecras_edge_flux_head_loss"] = edge_flux_loss
-                    loss_dict.update(edge_flux_metrics)
+                loss, loss_dict, _ = self.add_edge_flux_objectives(
+                    pred_one, graph, loss, loss_dict
+                )
                 if (
                     self.use_hecras_face_geometry_loss
                     and self.hecras_face_geometry_loss_weight > 0
@@ -880,6 +1448,7 @@ class MGNTrainer:
                         pred,
                         graph,
                         zone_mode=self.hecras_cell_balance_zone_mode,
+                        normalization=self.hecras_cell_balance_loss_normalization,
                     )
                     loss = (
                         loss
@@ -902,41 +1471,9 @@ class MGNTrainer:
                         * hecras_edge_flow_loss
                     )
                     loss_dict["hecras_edge_flow_loss"] = hecras_edge_flow_loss
-                if (
-                    self.edge_flux_head is not None
-                    and self.hecras_edge_flux_head_loss_weight > 0
-                ):
-                    edge_flux_delta = self.edge_flux_head(graph)
-                    edge_flux_loss, edge_flux_metrics = compute_hecras_edge_flux_head_loss(
-                        pred,
-                        edge_flux_delta,
-                        graph,
-                        zone_mode=self.hecras_edge_flux_head_zone_mode,
-                        zone_high_weight=(
-                            self.hecras_edge_flux_head_zone_high_weight
-                        ),
-                        zone_low_weight=(
-                            self.hecras_edge_flux_head_zone_low_weight
-                        ),
-                        closure_target_weight=(
-                            self.hecras_edge_flux_head_closure_target_weight
-                        ),
-                        divergence_target_weight=(
-                            self.hecras_edge_flux_head_divergence_target_weight
-                        ),
-                        face_target_weight=(
-                            self.hecras_edge_flux_head_face_target_weight
-                        ),
-                        face_loss_normalization=(
-                            self.hecras_edge_flux_head_face_loss_normalization
-                        ),
-                    )
-                    loss = (
-                        loss
-                        + self.hecras_edge_flux_head_loss_weight * edge_flux_loss
-                    )
-                    loss_dict["hecras_edge_flux_head_loss"] = edge_flux_loss
-                    loss_dict.update(edge_flux_metrics)
+                loss, loss_dict, _ = self.add_edge_flux_objectives(
+                    pred, graph, loss, loss_dict
+                )
                 if (
                     self.use_hecras_face_geometry_loss
                     and self.hecras_face_geometry_loss_weight > 0

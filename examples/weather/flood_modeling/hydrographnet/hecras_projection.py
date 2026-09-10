@@ -32,7 +32,7 @@ def selected_node_mask(graph, mode: str, device: torch.device) -> torch.Tensor:
     zone_label = graph.zone_label.to(device)
     if mode == "high":
         return zone_label == 3
-    if mode == "high_interior":
+    if mode in ("high_interior", "high_interior_control_volume"):
         if not hasattr(graph, "hecras_boundary_node_mask"):
             return zone_label == 3
         return (zone_label == 3) & (~graph.hecras_boundary_node_mask.to(device))
@@ -99,7 +99,7 @@ class ProjectionSolver:
     """Reusable sparse projection system for one graph/mode/weight setting."""
 
     weighted_incidence: sp.csr_matrix
-    selected: np.ndarray
+    target_operator: sp.csr_matrix
     sqrt_weights: np.ndarray
     solve_fn: object
     solver: str
@@ -134,16 +134,53 @@ def build_projection_solver(
         return None
 
     incidence = build_selected_incidence(graph, mask)
-    weights = selected_node_weights(
-        graph,
-        mode,
-        mask,
-        device,
-        high_weight=high_weight,
-        low_weight=low_weight,
+    selected_node_indices = np.flatnonzero(mask.detach().cpu().numpy())
+    target_operator = sp.csr_matrix(
+        (
+            np.ones(selected_node_indices.size, dtype=np.float64),
+            (np.arange(selected_node_indices.size), selected_node_indices),
+        ),
+        shape=(selected_node_indices.size, graph.x.shape[0]),
     )
-    selected = mask.detach().cpu().numpy()
-    sqrt_weights = np.sqrt(weights.detach().cpu().double().numpy().reshape(-1))
+    if mode == "high_interior_control_volume":
+        if not hasattr(graph, "hecras_high_interior_control_volume_label"):
+            raise AttributeError(
+                "high_interior_control_volume projection requires "
+                "graph.hecras_high_interior_control_volume_label."
+            )
+        labels = (
+            graph.hecras_high_interior_control_volume_label[mask]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.int64)
+        )
+        if np.any(labels < 0):
+            raise ValueError(
+                "Every selected high-interior node requires a control-volume label."
+            )
+        num_components = int(np.max(labels)) + 1
+        aggregation = sp.csr_matrix(
+            (
+                np.ones(labels.size, dtype=np.float64),
+                (labels, np.arange(labels.size)),
+            ),
+            shape=(num_components, labels.size),
+        )
+        incidence = aggregation @ incidence
+        target_operator = aggregation @ target_operator
+        weights_array = np.bincount(labels, minlength=num_components).astype(np.float64)
+    else:
+        weights = selected_node_weights(
+            graph,
+            mode,
+            mask,
+            device,
+            high_weight=high_weight,
+            low_weight=low_weight,
+        )
+        weights_array = weights.detach().cpu().double().numpy().reshape(-1)
+    sqrt_weights = np.sqrt(weights_array)
     weighted_incidence = sp.diags(sqrt_weights, format="csr") @ incidence
     lhs = weighted_incidence @ weighted_incidence.T
     if ridge > 0:
@@ -158,7 +195,7 @@ def build_projection_solver(
 
     return ProjectionSolver(
         weighted_incidence=weighted_incidence,
-        selected=selected,
+        target_operator=target_operator,
         sqrt_weights=sqrt_weights,
         solve_fn=solve_fn,
         solver=solver,
@@ -206,7 +243,7 @@ def project_edge_flux(
     target = divergence_target.detach().cpu().double().numpy().reshape(-1)
     residual = (
         cached_solver.weighted_incidence @ q0
-        - cached_solver.sqrt_weights * target[cached_solver.selected]
+        - cached_solver.sqrt_weights * (cached_solver.target_operator @ target)
     )
     if residual.size == 0:
         return edge_flux, 0, 0.0

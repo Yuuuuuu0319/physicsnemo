@@ -212,6 +212,8 @@ def main(cfg: DictConfig):
         split="test",
         rollout_length=rollout_length,
         return_physics=False,
+        dynamic_skip_steps=cfg.get("dynamic_skip_steps"),
+        post_peak_steps=cfg.get("post_peak_steps"),
     )
     print(f"Loaded test dataset with {len(test_dataset)} hydrographs.")
 
@@ -318,7 +320,8 @@ def main(cfg: DictConfig):
     print("Overall Mean RMSE over rollout steps:", overall_mean_rmse)
     print("Overall Std RMSE over rollout steps:", overall_std_rmse)
 
-    timesteps = [(i + 1) * (20 / 60) for i in range(rollout_length)]
+    timestep_hours = float(cfg.get("delta_t", 1200.0)) / 3600.0
+    timesteps = [(i + 1) * timestep_hours for i in range(rollout_length)]
     plt.figure(figsize=(10, 6))
     plt.plot(timesteps, overall_mean_rmse.numpy(), label="Mean RMSE", linewidth=3)
     plt.fill_between(

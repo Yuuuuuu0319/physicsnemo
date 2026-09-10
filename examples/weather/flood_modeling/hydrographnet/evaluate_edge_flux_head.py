@@ -112,6 +112,7 @@ def evaluate_checkpoint(
                     closure_target_weight=args.closure_target_weight,
                     divergence_target_weight=args.divergence_target_weight,
                     face_target_weight=args.face_target_weight,
+                    face_zone_mode=args.face_zone_mode,
                     face_loss_normalization=args.face_loss_normalization,
                 )
                 add_value(sums, "selected_edge_flux_head_loss", loss)
@@ -202,6 +203,7 @@ def main() -> None:
     parser.add_argument("--closure-target-weight", type=float, default=1.0)
     parser.add_argument("--divergence-target-weight", type=float, default=1.0)
     parser.add_argument("--face-target-weight", type=float, default=0.0)
+    parser.add_argument("--face-zone-mode")
     parser.add_argument(
         "--face-loss-normalization",
         default="none",

@@ -1,0 +1,11 @@
+defaults:
+  - formal_si5m_selective_hard
+  - _self_
+
+# Staged control: freeze a trained HydroGraphNet node backbone and optimize
+# only the selective edge head. Override all seed-specific paths together.
+seed: 0
+init_mesh_checkpoint_path: /mnt/8tb_hdd2/joyce/formal_si5m_runs/baseline_seed0
+init_mesh_checkpoint_epoch: null
+ckpt_path: /mnt/8tb_hdd2/joyce/formal_si5m_runs/selective_hard_staged_seed0
+freeze_mesh_model_for_edge_flux_head: true

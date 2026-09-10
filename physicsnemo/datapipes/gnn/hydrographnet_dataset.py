@@ -327,6 +327,12 @@ class HydroGraphDataset(Dataset):
         hecras_face_time_offset: int = 0,
         return_hecras_cell_balance: bool = False,
         hecras_cell_balance_glob: Optional[str] = None,
+        hecras_cell_balance_npz: Optional[Union[str, Path]] = None,
+        hecras_cell_balance_target_dir: Optional[Union[str, Path]] = None,
+        hecras_cell_balance_npz_key_suffix: str = (
+            "_cell_balance_storage_delta"
+        ),
+        hecras_cell_balance_time_offset: Optional[int] = None,
         hecras_cell_balance_path: str = (
             "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/"
             "2D Flow Areas/per2/Cell Flow Balance"
@@ -346,10 +352,18 @@ class HydroGraphDataset(Dataset):
         ),
         return_hecras_edge_flow: bool = False,
         hecras_edge_flow_npz: Optional[Union[str, Path]] = None,
+        hecras_conservative_edge_target_dir: Optional[Union[str, Path]] = None,
         hecras_edge_flow_mode: str = "all_touching",
         hecras_edge_flow_face_stats_npz: Optional[Union[str, Path]] = None,
         hecras_edge_flow_scale_stats_npz: Optional[Union[str, Path]] = None,
         norm_stats_dir: Optional[Union[str, Path]] = None,
+        precipitation_unit_conversion: float = 2.7778e-7,
+        local_source_runoff_mode: str = "ip_fraction",
+        require_node_precipitation: bool = False,
+        hecras_edge_flow_time_offset: Optional[int] = None,
+        dynamic_skip_steps: Optional[int] = None,
+        post_peak_steps: Optional[int] = None,
+        training_rollout_steps: int = 1,
     ):
         if split not in {"train", "test"}:
             raise ValueError(f"Invalid split '{split}'. Expected 'train' or 'test'.")
@@ -357,6 +371,21 @@ class HydroGraphDataset(Dataset):
         # Initialize dataset attributes.
         self.data_dir = str(data_dir)
         ensure_data_available(self.data_dir)
+        time_contract = self.load_dataset_time_contract(self.data_dir)
+        self.dynamic_skip_steps = int(
+            dynamic_skip_steps
+            if dynamic_skip_steps is not None
+            else time_contract.get("dynamic_skip_steps", 72)
+        )
+        self.post_peak_steps = int(
+            post_peak_steps
+            if post_peak_steps is not None
+            else time_contract.get("post_peak_steps", 25)
+        )
+        if self.dynamic_skip_steps < 0:
+            raise ValueError("dynamic_skip_steps must be non-negative.")
+        if self.post_peak_steps <= 0:
+            raise ValueError("post_peak_steps must be positive.")
         self.prefix = prefix
         self.num_samples = num_samples
         self.n_time_steps = n_time_steps
@@ -365,6 +394,18 @@ class HydroGraphDataset(Dataset):
         self.noise_type = noise_type
         self.hydrograph_ids_file = hydrograph_ids_file
         self.split = split
+        self.training_rollout_steps = int(training_rollout_steps)
+        if self.training_rollout_steps < 1:
+            raise ValueError("training_rollout_steps must be positive.")
+        if self.split != "train" and self.training_rollout_steps != 1:
+            raise ValueError(
+                "training_rollout_steps is only supported for split='train'."
+            )
+        if self.training_rollout_steps > 1 and self.noise_type == "pushforward":
+            raise ValueError(
+                "Explicit training rollouts and legacy pushforward noise cannot "
+                "be enabled together."
+            )
         # rollout_length is only used when split=="test"
         self.rollout_length = rollout_length if rollout_length is not None else 0
         self.return_physics = return_physics
@@ -386,6 +427,31 @@ class HydroGraphDataset(Dataset):
         self.hecras_face_time_offset = hecras_face_time_offset
         self.return_hecras_cell_balance = return_hecras_cell_balance
         self.hecras_cell_balance_glob = hecras_cell_balance_glob
+        self.hecras_cell_balance_npz = (
+            str(hecras_cell_balance_npz)
+            if hecras_cell_balance_npz is not None
+            else None
+        )
+        self.hecras_cell_balance_target_dir = (
+            str(hecras_cell_balance_target_dir)
+            if hecras_cell_balance_target_dir is not None
+            else None
+        )
+        self.hecras_cell_balance_npz_key_suffix = (
+            hecras_cell_balance_npz_key_suffix
+        )
+        if hecras_cell_balance_time_offset is None:
+            self.hecras_cell_balance_time_offset = (
+                self.dynamic_skip_steps
+                if self.hecras_cell_balance_target_dir is not None
+                else 0
+            )
+        else:
+            self.hecras_cell_balance_time_offset = int(
+                hecras_cell_balance_time_offset
+            )
+        if self.hecras_cell_balance_time_offset < 0:
+            raise ValueError("hecras_cell_balance_time_offset must be non-negative.")
         self.hecras_cell_balance_path = hecras_cell_balance_path
         self.hecras_precipitation_path = hecras_precipitation_path
         self.hecras_result_time_path = hecras_result_time_path
@@ -394,6 +460,11 @@ class HydroGraphDataset(Dataset):
         self.return_hecras_edge_flow = return_hecras_edge_flow
         self.hecras_edge_flow_npz = (
             str(hecras_edge_flow_npz) if hecras_edge_flow_npz is not None else None
+        )
+        self.hecras_conservative_edge_target_dir = (
+            str(hecras_conservative_edge_target_dir)
+            if hecras_conservative_edge_target_dir is not None
+            else None
         )
         self.hecras_edge_flow_mode = hecras_edge_flow_mode
         self.hecras_edge_flow_face_stats_npz = (
@@ -407,6 +478,24 @@ class HydroGraphDataset(Dataset):
             else None
         )
         self.norm_stats_dir = str(norm_stats_dir) if norm_stats_dir is not None else None
+        self.precipitation_unit_conversion = float(precipitation_unit_conversion)
+        self.local_source_runoff_mode = local_source_runoff_mode
+        self.require_node_precipitation = bool(require_node_precipitation)
+        if hecras_edge_flow_time_offset is None:
+            self.hecras_edge_flow_time_offset = (
+                self.dynamic_skip_steps
+                if self.hecras_conservative_edge_target_dir is not None
+                else 0
+            )
+        else:
+            self.hecras_edge_flow_time_offset = int(hecras_edge_flow_time_offset)
+        if self.hecras_edge_flow_time_offset < 0:
+            raise ValueError("hecras_edge_flow_time_offset must be non-negative.")
+        if self.local_source_runoff_mode not in {"ip_fraction", "full_area"}:
+            raise ValueError(
+                "local_source_runoff_mode must be 'ip_fraction' or 'full_area', "
+                f"got {self.local_source_runoff_mode!r}."
+            )
 
         # Placeholders for static and dynamic data, indices, and normalization stats.
         self.static_data = {}
@@ -426,6 +515,7 @@ class HydroGraphDataset(Dataset):
         self.hecras_edge_flow_face_stats = None
         self.hecras_edge_flow_scale_stats = None
         self.hecras_boundary_node_mask = None
+        self.hecras_high_interior_control_volume_label = None
 
         self.process()
 
@@ -544,8 +634,14 @@ class HydroGraphDataset(Dataset):
                 velocity_y,
                 volume,
                 precipitation,
+                local_precipitation,
             ) = self.load_dynamic_data(
-                self.data_dir, hid, self.prefix, num_points=num_nodes
+                self.data_dir,
+                hid,
+                self.prefix,
+                num_points=num_nodes,
+                skip=self.dynamic_skip_steps,
+                post_peak_steps=self.post_peak_steps,
             )
             temp_dynamic_data.append(
                 {
@@ -555,6 +651,7 @@ class HydroGraphDataset(Dataset):
                     "velocity_y": velocity_y,
                     "volume": volume,
                     "precipitation": precipitation,
+                    "local_precipitation": local_precipitation,
                     "hydro_id": hid,
                 }
             )
@@ -616,6 +713,7 @@ class HydroGraphDataset(Dataset):
                 ),
                 "velocity_x": dyn["velocity_x"],
                 "velocity_y": dyn["velocity_y"],
+                "local_precipitation": dyn["local_precipitation"],
                 "hydro_id": dyn["hydro_id"],
             }
             self.dynamic_data.append(dyn_std)
@@ -631,6 +729,9 @@ class HydroGraphDataset(Dataset):
             self.hecras_edge_flow_face_stats = self.load_hecras_edge_flow_face_stats()
             self.hecras_edge_flow_scale_stats = self.load_hecras_edge_flow_scale_stats()
             self.hecras_boundary_node_mask = self.load_hecras_boundary_node_mask()
+            self.hecras_high_interior_control_volume_label = (
+                self.build_hecras_high_interior_control_volume_labels()
+            )
 
         # Build sample indices for training (sliding window) or validate test data.
         if self.split == "train":
@@ -639,7 +740,12 @@ class HydroGraphDataset(Dataset):
                 if self.noise_type == "pushforward":
                     max_t = T - self.n_time_steps - 1
                 else:
-                    max_t = T - self.n_time_steps
+                    max_t = (
+                        T
+                        - self.n_time_steps
+                        - self.training_rollout_steps
+                        + 1
+                    )
                 for t in range(max_t):
                     self.sample_index.append((h_idx, t))
             self.length = len(self.sample_index)
@@ -712,6 +818,42 @@ class HydroGraphDataset(Dataset):
             g.edge_attr = torch.tensor(sd["edge_features"], dtype=torch.float)
             g.x = torch.tensor(node_features, dtype=torch.float)
             g.y = torch.tensor(target, dtype=torch.float)
+            if self.training_rollout_steps > 1:
+                rollout_slice = slice(
+                    target_time, target_time + self.training_rollout_steps
+                )
+                rollout_state = np.stack(
+                    (
+                        dyn["water_depth"][rollout_slice, :].T,
+                        dyn["volume"][rollout_slice, :].T,
+                    ),
+                    axis=2,
+                )
+                g.training_rollout_target_state = torch.tensor(
+                    rollout_state, dtype=torch.float
+                )
+                g.training_rollout_inflow = torch.tensor(
+                    dyn["inflow_hydrograph"][rollout_slice][None, :],
+                    dtype=torch.float,
+                )
+                g.training_rollout_precipitation = torch.tensor(
+                    dyn["precipitation"][rollout_slice][None, :],
+                    dtype=torch.float,
+                )
+                local_source_rates = np.stack(
+                    [
+                        self.compute_local_source_rate(
+                            dyn,
+                            target_time + step - 1,
+                            target_time + step,
+                        )
+                        for step in range(self.training_rollout_steps)
+                    ],
+                    axis=1,
+                )
+                g.training_rollout_local_source_rate = torch.tensor(
+                    local_source_rates, dtype=torch.float
+                )
             if self.use_fidelity_zones:
                 g.zone_label = torch.tensor(self.zone_label, dtype=torch.long)
                 g.zone_weight = torch.tensor(self.zone_weight, dtype=torch.float)
@@ -768,6 +910,13 @@ class HydroGraphDataset(Dataset):
                 self.add_hecras_edge_flow_attrs(
                     g, prev_time, self.hydrograph_ids[hydro_idx]
                 )
+                if self.training_rollout_steps > 1:
+                    self.add_hecras_edge_flow_rollout_attrs(
+                        g,
+                        prev_time,
+                        self.training_rollout_steps,
+                        self.hydrograph_ids[hydro_idx],
+                    )
 
             # Determine if physics data should be returned.
             need_physics = self.return_physics or (self.noise_type == "pushforward")
@@ -818,6 +967,25 @@ class HydroGraphDataset(Dataset):
                     + self.dynamic_stats["precipitation"]["mean"]
                 )
 
+                physical_area = sd["area_denorm"].reshape(-1)
+                if self.hecras_face_graph is not None and self.hecras_face_graph.get(
+                    "node_surface_area"
+                ) is not None:
+                    physical_area = self.hecras_face_graph[
+                        "node_surface_area"
+                    ].reshape(-1)
+                if self.local_source_runoff_mode == "full_area":
+                    effective_precipitation_area_sum = float(np.sum(physical_area))
+                else:
+                    runoff_percentage = self.denormalize(
+                        sd["infiltration"],
+                        self.static_stats["infiltration"]["mean"],
+                        self.static_stats["infiltration"]["std"],
+                    ).reshape(-1)
+                    effective_precipitation_area_sum = float(
+                        np.sum((runoff_percentage / 100.0) * physical_area)
+                    )
+
                 # Build the complete physics data dictionary.
                 full_physics_data = {
                     "flow_future": float(
@@ -843,18 +1011,8 @@ class HydroGraphDataset(Dataset):
                     "precip_mean": float(self.dynamic_stats["precipitation"]["mean"]),
                     "precip_std": float(self.dynamic_stats["precipitation"]["std"]),
                     "num_nodes": float(sd["xy_coords"].shape[0]),
-                    "area_sum": float(np.sum(sd["area_denorm"])),
-                    "infiltration_area_sum": float(
-                        np.sum(
-                            self.denormalize(
-                                sd["infiltration"],
-                                self.static_stats["infiltration"]["mean"],
-                                self.static_stats["infiltration"]["std"],
-                            )
-                            * sd["area_denorm"]
-                        )
-                    )
-                    / 100.0,
+                    "area_sum": float(np.sum(physical_area)),
+                    "infiltration_area_sum": effective_precipitation_area_sum,
                 }
                 # For pushforward noise without full physics data requested.
                 if not self.return_physics and self.noise_type == "pushforward":
@@ -972,6 +1130,13 @@ class HydroGraphDataset(Dataset):
                     dtype=torch.float,
                 ),
             }
+            if dyn["local_precipitation"] is not None:
+                rollout_data["local_precipitation"] = torch.tensor(
+                    dyn["local_precipitation"][
+                        self.n_time_steps : self.n_time_steps + self.rollout_length
+                    ],
+                    dtype=torch.float,
+                )
             return g, rollout_data
 
     def __len__(self) -> int:
@@ -1037,9 +1202,16 @@ class HydroGraphDataset(Dataset):
         self,
         hydrograph_id: str,
         interval: int = 1,
-        skip: int = 72,
+        skip: Optional[int] = None,
+        post_peak_steps: Optional[int] = None,
     ) -> np.ndarray:
         """Load the HGN event time axis after the dataset's skip and peak trim."""
+        skip = self.dynamic_skip_steps if skip is None else int(skip)
+        post_peak_steps = (
+            self.post_peak_steps
+            if post_peak_steps is None
+            else int(post_peak_steps)
+        )
         inflow_path = os.path.join(
             self.data_dir, f"{self.prefix}_US_InF_{hydrograph_id}.txt"
         )
@@ -1047,7 +1219,24 @@ class HydroGraphDataset(Dataset):
         time_days = np.asarray(inflow[skip::interval, 0], dtype=np.float64)
         inflow_hydrograph = np.asarray(inflow[skip::interval, 1], dtype=np.float64)
         peak_time_idx = int(np.argmax(inflow_hydrograph))
-        return time_days[: peak_time_idx + 25]
+        return time_days[: peak_time_idx + post_peak_steps]
+
+    @staticmethod
+    def load_dataset_time_contract(data_dir: Union[str, Path]) -> dict[str, Any]:
+        """Read optional validated timing metadata without changing legacy defaults."""
+        contract_path = Path(data_dir) / "hgn_dataset_validation.json"
+        if not contract_path.is_file():
+            return {}
+        try:
+            payload = json.loads(contract_path.read_text())
+            contract = payload.get("model_time_contract", {})
+            if not isinstance(contract, dict):
+                raise TypeError("model_time_contract must be a JSON object")
+            return contract
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError(
+                f"Invalid HydroGraphNet dataset timing contract: {contract_path}"
+            ) from exc
 
     @staticmethod
     def match_hgn_times_to_hdf(
@@ -1087,13 +1276,96 @@ class HydroGraphDataset(Dataset):
         return original_indices.astype(np.int64)
 
     def load_hecras_cell_balance_delta_by_hydrograph(self) -> dict[str, np.ndarray]:
-        """Precompute formal HEC-RAS cell budget deltas aligned to HGN intervals.
+        """Load cell-budget deltas aligned to HGN prediction intervals.
 
-        The target is native ``Cell Flow Balance`` integrated over each HGN
-        interval plus native cumulative precipitation depth converted to cell
-        volume. Values are denormalized ft^3 and are intentionally separate
-        from the older face-velocity proxy loss.
+        Formal SI five-minute targets are derived from HEC-RAS period-average
+        face flow plus precipitation, then stored as event-sharded arrays. The
+        legacy NPZ and native-HDF paths remain available for compatibility and
+        diagnostics; point-sampled five-minute ``Cell Flow Balance`` must not be
+        treated as a conservative interval integral.
         """
+        target_dir = getattr(self, "hecras_cell_balance_target_dir", None)
+        cell_balance_npz = getattr(self, "hecras_cell_balance_npz", None)
+        cell_balance_glob = getattr(self, "hecras_cell_balance_glob", None)
+        if target_dir is not None:
+            if cell_balance_npz is not None or (
+                cell_balance_glob is not None
+            ):
+                raise ValueError(
+                    "Specify only one Cell Flow Balance target source."
+                )
+            directory = Path(target_dir)
+            selected_path = directory / "selected_node_index.npy"
+            if not selected_path.is_file():
+                raise FileNotFoundError(selected_path)
+            selected_nodes = np.load(selected_path, mmap_mode="r")
+            if selected_nodes.ndim != 1 or (
+                selected_nodes.size
+                and int(np.max(selected_nodes))
+                >= self.static_data["xy_coords"].shape[0]
+            ):
+                raise ValueError(
+                    "Cell-budget selected node indexes do not match the HGN graph."
+                )
+            loaded = {}
+            suffix = "period_average_cell_budget_delta_selected_m3"
+            for hydrograph_id in self.hydrograph_ids:
+                path = directory / f"{hydrograph_id}_{suffix}.npy"
+                if not path.is_file():
+                    raise FileNotFoundError(path)
+                target = np.load(path, mmap_mode="r")
+                if target.ndim != 2 or target.shape[1] != selected_nodes.size:
+                    raise ValueError(
+                        f"Cell-budget target {path} must have shape "
+                        f"(transitions, {selected_nodes.size}), got {target.shape}."
+                    )
+                loaded[hydrograph_id] = {
+                    "selected": target,
+                    "selected_nodes": selected_nodes,
+                }
+            return loaded
+
+        if cell_balance_npz is not None:
+            if cell_balance_glob is not None:
+                raise ValueError(
+                    "Specify only one of hecras_cell_balance_npz and "
+                    "hecras_cell_balance_glob."
+                )
+            path = Path(cell_balance_npz)
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            requested_hydrographs = set(self.hydrograph_ids)
+            loaded: dict[str, np.ndarray] = {}
+            with np.load(path, allow_pickle=False) as data:
+                suffix = self.hecras_cell_balance_npz_key_suffix
+                for key in data.files:
+                    if not key.endswith(suffix):
+                        continue
+                    hydrograph_id = key[: -len(suffix)]
+                    if hydrograph_id not in requested_hydrographs:
+                        continue
+                    target = np.asarray(data[key], dtype=np.float32)
+                    if target.ndim != 2:
+                        raise ValueError(
+                            f"{key} in {path} must have shape (transitions, nodes), "
+                            f"got {target.shape}."
+                        )
+                    if target.shape[1] != self.static_data["xy_coords"].shape[0]:
+                        raise ValueError(
+                            f"{key} has {target.shape[1]} nodes, but the HGN graph "
+                            f"has {self.static_data['xy_coords'].shape[0]}."
+                        )
+                    if not np.all(np.isfinite(target)):
+                        raise ValueError(f"{key} in {path} contains non-finite values.")
+                    loaded[hydrograph_id] = target
+            missing = sorted(requested_hydrographs - set(loaded))
+            if missing:
+                raise KeyError(
+                    f"Missing cell-balance NPZ targets for {missing} in {path}; "
+                    f"expected suffix {self.hecras_cell_balance_npz_key_suffix!r}."
+                )
+            return loaded
+
         try:
             import h5py
         except ImportError as exc:
@@ -1103,7 +1375,8 @@ class HydroGraphDataset(Dataset):
 
         if self.hecras_cell_balance_glob is None:
             raise ValueError(
-                "return_hecras_cell_balance=True requires hecras_cell_balance_glob."
+                "return_hecras_cell_balance=True requires either "
+                "hecras_cell_balance_npz or hecras_cell_balance_glob."
             )
         hdf_paths = self.load_hecras_event_hdf_paths(self.hecras_cell_balance_glob)
         balance_by_hydrograph = {}
@@ -1152,6 +1425,28 @@ class HydroGraphDataset(Dataset):
                 hdf_time_seconds = hdf_time_days * 86400.0
                 balance_dataset = hdf[self.hecras_cell_balance_path]
                 precip_dataset = hdf[self.hecras_precipitation_path]
+                balance_units = balance_dataset.attrs.get("Units", b"")
+                precip_units = precip_dataset.attrs.get("Units", b"")
+                if isinstance(balance_units, bytes):
+                    balance_units = balance_units.decode("utf-8")
+                if isinstance(precip_units, bytes):
+                    precip_units = precip_units.decode("utf-8")
+                balance_units = str(balance_units).replace("^", "").lower()
+                precip_units = str(precip_units).lower()
+                if balance_units in {"m3/s", "m3/sec"} and precip_units == "mm":
+                    precipitation_depth_to_length = 1.0e-3
+                elif balance_units in {
+                    "ft3/s",
+                    "ft3/sec",
+                    "cfs",
+                } and precip_units in {"in", "inch", "inches"}:
+                    precipitation_depth_to_length = 1.0 / 12.0
+                else:
+                    raise ValueError(
+                        "Unsupported HEC-RAS Cell Flow Balance/precipitation "
+                        f"unit pair in {hdf_path}: {balance_units!r}, "
+                        f"{precip_units!r}."
+                    )
                 deltas = np.zeros(
                     (target_time_indices.shape[0] - 1, original_indices.size),
                     dtype=np.float64,
@@ -1169,7 +1464,7 @@ class HydroGraphDataset(Dataset):
                         ],
                         nan=0.0,
                     )
-                    balance_delta = np.trapz(
+                    balance_delta = np.trapezoid(
                         balance_window,
                         x=hdf_time_seconds[start : end + 1],
                         axis=0,
@@ -1183,7 +1478,7 @@ class HydroGraphDataset(Dataset):
                                 original_indices
                             ]
                         )
-                        / 12.0
+                        * precipitation_depth_to_length
                         * cell_surface_area
                     )
                     deltas[transition_index] = balance_delta + precip_delta
@@ -1215,11 +1510,69 @@ class HydroGraphDataset(Dataset):
             raise ValueError("HEC-RAS HDF face index count does not match face count.")
         if face_normal.shape[0] != face_index.shape[1] or face_normal.shape[1] != 2:
             raise ValueError("HEC-RAS face normal shape must be (num_faces, 2).")
+        node_volume_table_top_elevation = (
+            np.asarray(
+                face_data["hgn_node_volume_table_top_elevation"], dtype=np.float32
+            )
+            if "hgn_node_volume_table_top_elevation" in face_data.files
+            else None
+        )
+        if (
+            node_volume_table_top_elevation is not None
+            and node_volume_table_top_elevation.shape != (num_nodes,)
+        ):
+            raise ValueError(
+                "HEC-RAS node volume-table top elevation must have shape "
+                f"({num_nodes},), got {node_volume_table_top_elevation.shape}."
+            )
+        stored_zone_sha256 = (
+            str(np.asarray(face_data["zone_label_sha256"]).reshape(-1)[0])
+            if "zone_label_sha256" in face_data.files
+            else ""
+        )
+        if stored_zone_sha256 and self.use_fidelity_zones:
+            zone_path = Path(self.data_dir) / self.zone_label_file
+            current_zone_sha256 = hashlib.sha256(zone_path.read_bytes()).hexdigest()
+            if current_zone_sha256 != stored_zone_sha256:
+                raise ValueError(
+                    "The HEC-RAS face graph was built for a different fidelity "
+                    f"zone mask: {stored_zone_sha256} != {current_zone_sha256}."
+                )
+        boundary_node_mask = (
+            np.asarray(face_data["boundary_node_mask"], dtype=np.bool_)
+            if "boundary_node_mask" in face_data.files
+            else None
+        )
+        control_volume_label = (
+            np.asarray(
+                face_data["high_interior_control_volume_label"], dtype=np.int64
+            )
+            if "high_interior_control_volume_label" in face_data.files
+            else None
+        )
+        for name, values in (
+            ("boundary_node_mask", boundary_node_mask),
+            ("high_interior_control_volume_label", control_volume_label),
+        ):
+            if values is not None and values.shape != (num_nodes,):
+                raise ValueError(
+                    f"HEC-RAS {name} must have shape ({num_nodes},), got "
+                    f"{values.shape}."
+                )
         return {
             "face_index": face_index,
             "face_length": face_length,
             "face_normal": face_normal,
             "hdf_face_index": hdf_face_index,
+            "node_surface_area": (
+                np.asarray(face_data["hgn_node_surface_area"], dtype=np.float32)
+                if "hgn_node_surface_area" in face_data.files
+                else None
+            ),
+            "node_volume_table_top_elevation": node_volume_table_top_elevation,
+            "boundary_node_mask": boundary_node_mask,
+            "high_interior_control_volume_label": control_volume_label,
+            "zone_label_sha256": stored_zone_sha256,
         }
 
     def load_hecras_face_velocity(self) -> np.ndarray:
@@ -1305,9 +1658,17 @@ class HydroGraphDataset(Dataset):
         graph.hecras_face_normal = torch.tensor(
             self.hecras_face_graph["face_normal"], dtype=torch.float
         )
-        graph.hecras_node_area = torch.tensor(
-            self.static_data["area_denorm"].reshape(-1), dtype=torch.float
+        node_surface_area = self.hecras_face_graph.get("node_surface_area")
+        if node_surface_area is None:
+            node_surface_area = self.static_data["area_denorm"].reshape(-1)
+        graph.hecras_node_area = torch.tensor(node_surface_area, dtype=torch.float)
+        node_volume_table_top_elevation = self.hecras_face_graph.get(
+            "node_volume_table_top_elevation"
         )
+        if node_volume_table_top_elevation is not None:
+            graph.hecras_node_volume_table_top_elevation = torch.tensor(
+                node_volume_table_top_elevation, dtype=torch.float
+            )
         src, dst = self.hecras_face_graph["face_index"]
         xy = self.static_data_raw_xy
         center_dx = xy[dst, 0] - xy[src, 0]
@@ -1410,20 +1771,115 @@ class HydroGraphDataset(Dataset):
                 f"No HEC-RAS cell-balance target loaded for {hydrograph_id}. "
                 f"Available hydrographs: {available}"
             )
-        if transition_index < 0 or transition_index >= cell_balance_delta.shape[0]:
+        transition_index += self.hecras_cell_balance_time_offset
+        target_length = (
+            cell_balance_delta["selected"].shape[0]
+            if isinstance(cell_balance_delta, dict)
+            else cell_balance_delta.shape[0]
+        )
+        if transition_index < 0 or transition_index >= target_length:
             raise IndexError(
                 f"HEC-RAS cell-balance transition index {transition_index} is outside "
-                f"0..{cell_balance_delta.shape[0] - 1} for {hydrograph_id}."
+                f"0..{target_length - 1} for {hydrograph_id}."
             )
-        graph.hecras_cell_balance_delta = torch.tensor(
-            cell_balance_delta[transition_index], dtype=torch.float
-        )
+        if isinstance(cell_balance_delta, dict):
+            values = np.zeros(graph.x.shape[0], dtype=np.float32)
+            values[np.asarray(cell_balance_delta["selected_nodes"])] = (
+                cell_balance_delta["selected"][transition_index]
+            )
+        else:
+            values = cell_balance_delta[transition_index]
+        graph.hecras_cell_balance_delta = torch.tensor(values, dtype=torch.float)
         graph.volume_std = torch.tensor(
             [self.dynamic_stats["volume"]["std"]], dtype=torch.float
         )
 
     def load_hecras_edge_flow_delta_by_hydrograph(self) -> dict[str, np.ndarray]:
         """Load precomputed HEC-RAS Face Flow deltas aligned to HGN intervals."""
+        if self.hecras_conservative_edge_target_dir is not None:
+            if self.hecras_edge_flow_mode != "conservative_sharded":
+                raise ValueError(
+                    "hecras_conservative_edge_target_dir requires "
+                    "hecras_edge_flow_mode='conservative_sharded'."
+                )
+            directory = Path(self.hecras_conservative_edge_target_dir)
+            if not directory.is_dir():
+                raise FileNotFoundError(directory)
+            selected_path = directory / "selected_node_index.npy"
+            if not selected_path.is_file():
+                raise FileNotFoundError(selected_path)
+            selected_nodes = np.load(selected_path, mmap_mode="r")
+            targets = {}
+            array_names = (
+                "raw_internal_face_delta_m3",
+                "projected_internal_face_delta_m3",
+                "target_internal_divergence_selected_m3",
+                "omitted_boundary_source_selected_m3",
+                "precipitation_volume_selected_m3",
+            )
+            for hydrograph_id in self.hydrograph_ids:
+                arrays = {}
+                for name in array_names:
+                    path = directory / f"{hydrograph_id}_{name}.npy"
+                    if not path.is_file():
+                        raise FileNotFoundError(path)
+                    arrays[name] = np.load(path, mmap_mode="r")
+                transition_count = arrays[
+                    "projected_internal_face_delta_m3"
+                ].shape[0]
+                if any(
+                    values.shape[0] != transition_count
+                    for values in arrays.values()
+                ):
+                    raise ValueError(
+                        f"Conservative target row mismatch for {hydrograph_id}."
+                    )
+                if any(
+                    arrays[name].shape[1] != selected_nodes.size
+                    for name in array_names[2:]
+                ):
+                    raise ValueError(
+                        f"Selected-node target width mismatch for {hydrograph_id}."
+                    )
+                if arrays["raw_internal_face_delta_m3"].shape != arrays[
+                    "projected_internal_face_delta_m3"
+                ].shape:
+                    raise ValueError(
+                        f"Raw/projected face target shape mismatch for {hydrograph_id}."
+                    )
+                dynamic_by_id = {
+                    item["hydro_id"]: item
+                    for item in getattr(self, "dynamic_data", [])
+                }
+                if hydrograph_id in dynamic_by_id:
+                    dynamic = dynamic_by_id[hydrograph_id]
+                    required_transition_count = (
+                        self.hecras_edge_flow_time_offset
+                        + max(int(dynamic["water_depth"].shape[0]) - 1, 0)
+                    )
+                    if transition_count < required_transition_count:
+                        raise ValueError(
+                            f"Conservative target for {hydrograph_id} has "
+                            f"{transition_count} transitions, but offset "
+                            f"{self.hecras_edge_flow_time_offset} and the trimmed "
+                            f"dynamic sequence require {required_transition_count}."
+                        )
+                targets[hydrograph_id] = {
+                    "raw_face": arrays["raw_internal_face_delta_m3"],
+                    "face": arrays["projected_internal_face_delta_m3"],
+                    "internal_selected": arrays[
+                        "target_internal_divergence_selected_m3"
+                    ],
+                    "boundary_selected": arrays[
+                        "omitted_boundary_source_selected_m3"
+                    ],
+                    "precipitation_selected": arrays[
+                        "precipitation_volume_selected_m3"
+                    ],
+                    "selected_nodes": selected_nodes,
+                }
+            return targets
+
         if self.hecras_edge_flow_npz is None:
             raise ValueError(
                 "return_hecras_edge_flow=True requires hecras_edge_flow_npz."
@@ -1432,6 +1888,7 @@ class HydroGraphDataset(Dataset):
         if not path.exists():
             raise FileNotFoundError(path)
         data = np.load(path)
+        requested_hydrographs = set(self.hydrograph_ids)
         deltas = {}
         if self.hecras_edge_flow_mode == "internal_plus_boundary_source":
             internal_suffix = "_internal_edge_delta"
@@ -1443,20 +1900,29 @@ class HydroGraphDataset(Dataset):
             for key in data.files:
                 if key.endswith(internal_suffix):
                     hydrograph_id = key[: -len(internal_suffix)]
-                    internal[hydrograph_id] = np.asarray(data[key], dtype=np.float32)
+                    if hydrograph_id in requested_hydrographs:
+                        internal[hydrograph_id] = np.asarray(
+                            data[key], dtype=np.float32
+                        )
                 elif key.endswith(boundary_suffix):
                     hydrograph_id = key[: -len(boundary_suffix)]
-                    boundary[hydrograph_id] = np.asarray(data[key], dtype=np.float32)
+                    if hydrograph_id in requested_hydrographs:
+                        boundary[hydrograph_id] = np.asarray(
+                            data[key], dtype=np.float32
+                        )
                 elif key.endswith(face_suffix):
                     hydrograph_id = key[: -len(face_suffix)]
-                    face[hydrograph_id] = np.asarray(data[key], dtype=np.float32)
+                    if hydrograph_id in requested_hydrographs:
+                        face[hydrograph_id] = np.asarray(data[key], dtype=np.float32)
             missing_boundary = sorted(set(internal) - set(boundary))
             missing_internal = sorted(set(boundary) - set(internal))
-            if missing_boundary or missing_internal:
+            missing_requested = sorted(requested_hydrographs - set(internal))
+            if missing_boundary or missing_internal or missing_requested:
                 raise KeyError(
                     "internal_plus_boundary_source requires paired arrays. "
                     f"Missing boundary for: {missing_boundary}; "
-                    f"missing internal for: {missing_internal}."
+                    f"missing internal for: {missing_internal}; "
+                    f"missing requested hydrographs: {missing_requested}."
                 )
             if not internal:
                 available = ", ".join(data.files)
@@ -1481,7 +1947,8 @@ class HydroGraphDataset(Dataset):
         for key in data.files:
             if key.endswith(suffix):
                 hydrograph_id = key[: -len(suffix)]
-                deltas[hydrograph_id] = np.asarray(data[key], dtype=np.float32)
+                if hydrograph_id in requested_hydrographs:
+                    deltas[hydrograph_id] = np.asarray(data[key], dtype=np.float32)
         if not deltas:
             available = ", ".join(data.files)
             raise KeyError(
@@ -1565,8 +2032,11 @@ class HydroGraphDataset(Dataset):
                 f"No HEC-RAS edge-flow target loaded for {hydrograph_id}. "
                 f"Available hydrographs: {available}"
             )
+        transition_index = transition_index + self.hecras_edge_flow_time_offset
         if isinstance(edge_flow_target, dict):
-            target_length = edge_flow_target["internal"].shape[0]
+            target_length = edge_flow_target.get(
+                "internal", edge_flow_target.get("face")
+            ).shape[0]
         else:
             target_length = edge_flow_target.shape[0]
         if transition_index < 0 or transition_index >= target_length:
@@ -1575,8 +2045,32 @@ class HydroGraphDataset(Dataset):
                 f"0..{target_length - 1} for {hydrograph_id}."
             )
         if isinstance(edge_flow_target, dict):
-            internal_delta = edge_flow_target["internal"][transition_index]
-            boundary_delta = edge_flow_target["boundary"][transition_index]
+            if "internal_selected" in edge_flow_target:
+                selected_nodes = np.asarray(
+                    edge_flow_target["selected_nodes"], dtype=np.int64
+                )
+                internal_delta = np.zeros(graph.x.shape[0], dtype=np.float32)
+                boundary_delta = np.zeros_like(internal_delta)
+                precipitation_delta = np.zeros_like(internal_delta)
+                internal_delta[selected_nodes] = edge_flow_target[
+                    "internal_selected"
+                ][transition_index]
+                boundary_delta[selected_nodes] = edge_flow_target[
+                    "boundary_selected"
+                ][transition_index]
+                precipitation_delta[selected_nodes] = edge_flow_target[
+                    "precipitation_selected"
+                ][transition_index]
+                graph.hecras_local_source_delta = torch.tensor(
+                    precipitation_delta, dtype=torch.float
+                )
+                graph.hecras_conservative_selected_node_mask = torch.tensor(
+                    np.isin(np.arange(graph.x.shape[0]), selected_nodes),
+                    dtype=torch.bool,
+                )
+            else:
+                internal_delta = edge_flow_target["internal"][transition_index]
+                boundary_delta = edge_flow_target["boundary"][transition_index]
             graph.hecras_edge_internal_delta = torch.tensor(
                 internal_delta, dtype=torch.float
             )
@@ -1595,6 +2089,11 @@ class HydroGraphDataset(Dataset):
                 graph.hecras_internal_face_flow_delta = torch.tensor(
                     edge_flow_target["face"][transition_index], dtype=torch.float
                 )
+                if "raw_face" in edge_flow_target:
+                    graph.hecras_raw_internal_face_flow_delta = torch.tensor(
+                        edge_flow_target["raw_face"][transition_index],
+                        dtype=torch.float,
+                    )
                 graph.hecras_previous_internal_face_flow_delta = torch.tensor(
                     previous_face_delta, dtype=torch.float
                 )
@@ -1654,12 +2153,108 @@ class HydroGraphDataset(Dataset):
             graph.hecras_boundary_node_mask = torch.tensor(
                 self.hecras_boundary_node_mask, dtype=torch.bool
             )
+        if self.hecras_high_interior_control_volume_label is not None:
+            graph.hecras_high_interior_control_volume_label = torch.tensor(
+                self.hecras_high_interior_control_volume_label, dtype=torch.long
+            )
         graph.volume_std = torch.tensor(
             [self.dynamic_stats["volume"]["std"]], dtype=torch.float
         )
 
+    def add_hecras_edge_flow_rollout_attrs(
+        self,
+        graph,
+        first_transition_index: int,
+        rollout_steps: int,
+        hydrograph_id: str,
+    ) -> None:
+        """Attach consecutive edge targets for differentiable training rollout."""
+
+        if rollout_steps < 2:
+            raise ValueError("Edge rollout attributes require at least two steps.")
+        target = self.hecras_edge_flow_delta_by_hydrograph.get(hydrograph_id)
+        if not isinstance(target, dict) or "face" not in target:
+            raise ValueError(
+                "Differentiable edge rollout requires paired sharded Face Flow "
+                f"targets for {hydrograph_id}."
+            )
+        first = first_transition_index + self.hecras_edge_flow_time_offset
+        last = first + rollout_steps
+        if first < 0 or last > target["face"].shape[0]:
+            raise IndexError(
+                f"Edge rollout transitions {first}..{last - 1} are outside "
+                f"0..{target['face'].shape[0] - 1} for {hydrograph_id}."
+            )
+        rows = slice(first, last)
+
+        if "internal_selected" in target:
+            selected_nodes = np.asarray(target["selected_nodes"], dtype=np.int64)
+            shape = (graph.x.shape[0], rollout_steps)
+            internal = np.zeros(shape, dtype=np.float32)
+            boundary = np.zeros(shape, dtype=np.float32)
+            precipitation = np.zeros(shape, dtype=np.float32)
+            internal[selected_nodes] = np.asarray(
+                target["internal_selected"][rows], dtype=np.float32
+            ).T
+            boundary[selected_nodes] = np.asarray(
+                target["boundary_selected"][rows], dtype=np.float32
+            ).T
+            precipitation[selected_nodes] = np.asarray(
+                target["precipitation_selected"][rows], dtype=np.float32
+            ).T
+        else:
+            internal = np.asarray(target["internal"][rows], dtype=np.float32).T
+            boundary = np.asarray(target["boundary"][rows], dtype=np.float32).T
+            precipitation = np.zeros_like(internal)
+
+        face = np.asarray(target["face"][rows], dtype=np.float32).T
+        previous_rows = np.arange(first, last, dtype=np.int64) - 1
+        previous = np.zeros_like(face)
+        valid_previous = previous_rows >= 0
+        if np.any(valid_previous):
+            previous[:, valid_previous] = np.asarray(
+                target["face"][previous_rows[valid_previous]], dtype=np.float32
+            ).T
+
+        graph.training_rollout_edge_internal_delta = torch.tensor(
+            internal, dtype=torch.float
+        )
+        graph.training_rollout_edge_boundary_source_delta = torch.tensor(
+            boundary, dtype=torch.float
+        )
+        graph.training_rollout_edge_precipitation_delta = torch.tensor(
+            precipitation, dtype=torch.float
+        )
+        graph.training_rollout_internal_face_flow_delta = torch.tensor(
+            face, dtype=torch.float
+        )
+        graph.training_rollout_previous_internal_face_flow_delta = torch.tensor(
+            previous, dtype=torch.float
+        )
+        if "raw_face" in target:
+            graph.training_rollout_raw_internal_face_flow_delta = torch.tensor(
+                np.asarray(target["raw_face"][rows], dtype=np.float32).T,
+                dtype=torch.float,
+            )
+        if self.hecras_edge_flow_scale_stats is not None:
+            transition_rms = self.hecras_edge_flow_scale_stats[
+                "transition_rms_by_id"
+            ].get(hydrograph_id)
+            if transition_rms is None or last > transition_rms.shape[0]:
+                raise IndexError(
+                    f"Face Flow scale stats do not cover rollout for {hydrograph_id}."
+                )
+            graph.training_rollout_internal_face_flow_transition_rms = torch.tensor(
+                np.asarray(transition_rms[rows], dtype=np.float32)[None, :],
+                dtype=torch.float,
+            )
+
     def load_hecras_boundary_node_mask(self) -> Optional[np.ndarray]:
         """Load nodes touched by HEC-RAS boundary/ghost faces, if available."""
+        if self.hecras_face_graph is not None:
+            stored = self.hecras_face_graph.get("boundary_node_mask")
+            if stored is not None:
+                return np.asarray(stored, dtype=np.bool_).copy()
         if self.hecras_face_graph_file is None:
             return None
 
@@ -1679,11 +2274,67 @@ class HydroGraphDataset(Dataset):
         if hdf_to_hgn.size == 0:
             return None
 
-        mapped = hdf_to_hgn[boundary_cells.reshape(-1)]
+        boundary_cells = boundary_cells.reshape(-1)
+        boundary_cells = boundary_cells[
+            (boundary_cells >= 0) & (boundary_cells < hdf_to_hgn.size)
+        ]
+        mapped = hdf_to_hgn[boundary_cells]
         mapped = mapped[(mapped >= 0) & (mapped < num_nodes)]
         mask = np.zeros(num_nodes, dtype=np.bool_)
         mask[mapped] = True
         return mask
+
+    def build_hecras_high_interior_control_volume_labels(
+        self,
+    ) -> Optional[np.ndarray]:
+        """Label connected control volumes in the fixed high-zone interior mask."""
+
+        if (
+            self.hecras_face_graph is None
+            or self.zone_label is None
+            or self.hecras_boundary_node_mask is None
+        ):
+            return None
+        stored = self.hecras_face_graph.get("high_interior_control_volume_label")
+        if stored is not None:
+            stored = np.asarray(stored, dtype=np.int64)
+            expected_mask = (self.zone_label == 3) & (
+                ~self.hecras_boundary_node_mask
+            )
+            if not np.array_equal(stored >= 0, expected_mask):
+                raise ValueError(
+                    "Stored high-interior control-volume scope does not match "
+                    "the current zone labels and boundary mask."
+                )
+            return stored.copy()
+        node_mask = (self.zone_label == 3) & (~self.hecras_boundary_node_mask)
+        parent = np.arange(node_mask.size, dtype=np.int64)
+
+        def find(node: int) -> int:
+            while parent[node] != node:
+                parent[node] = parent[parent[node]]
+                node = int(parent[node])
+            return node
+
+        def union(first: int, second: int) -> None:
+            first_root = find(first)
+            second_root = find(second)
+            if first_root != second_root:
+                parent[second_root] = first_root
+
+        src, dst = self.hecras_face_graph["face_index"]
+        selected_faces = node_mask[src] & node_mask[dst]
+        for first, second in zip(src[selected_faces], dst[selected_faces]):
+            union(int(first), int(second))
+
+        labels = np.full(node_mask.size, -1, dtype=np.int64)
+        selected_nodes = np.flatnonzero(node_mask)
+        roots = np.asarray(
+            [find(int(node)) for node in selected_nodes], dtype=np.int64
+        )
+        _, compact_labels = np.unique(roots, return_inverse=True)
+        labels[selected_nodes] = compact_labels
+        return labels
 
     def compute_local_source_rate(
         self, dyn: dict[str, np.ndarray], prev_time: int, target_time: int
@@ -1694,21 +2345,35 @@ class HydroGraphDataset(Dataset):
         m/s. `M80_IP` is treated consistently with the existing global physics
         loss, where infiltration is used as a percentage multiplier.
         """
-        prev_precip = dyn["precipitation"][prev_time]
-        target_precip = dyn["precipitation"][target_time]
-        avg_precip_norm = 0.5 * (prev_precip + target_precip)
-        avg_precip = self.denormalize(
-            avg_precip_norm,
-            self.dynamic_stats["precipitation"]["mean"],
-            self.dynamic_stats["precipitation"]["std"],
-        )
-        infiltration = self.denormalize(
-            self.static_data["infiltration"],
-            self.static_stats["infiltration"]["mean"],
-            self.static_stats["infiltration"]["std"],
-        ).reshape(-1)
-        area = self.static_data["area_denorm"].reshape(-1)
-        return avg_precip * area * (infiltration / 100.0)
+        if dyn.get("local_precipitation") is not None:
+            # M80_PrNode stores the rate applied over the interval ending at
+            # target_time. It is a known model input in physical m/s.
+            precipitation_rate = dyn["local_precipitation"][target_time]
+        else:
+            prev_precip = dyn["precipitation"][prev_time]
+            target_precip = dyn["precipitation"][target_time]
+            avg_precip_norm = 0.5 * (prev_precip + target_precip)
+            precipitation_rate = self.denormalize(
+                avg_precip_norm,
+                self.dynamic_stats["precipitation"]["mean"],
+                self.dynamic_stats["precipitation"]["std"],
+            )
+        if self.hecras_face_graph is not None and self.hecras_face_graph.get(
+            "node_surface_area"
+        ) is not None:
+            area = self.hecras_face_graph["node_surface_area"].reshape(-1)
+        else:
+            area = self.static_data["area_denorm"].reshape(-1)
+        if self.local_source_runoff_mode == "full_area":
+            runoff_fraction = np.ones_like(area)
+        else:
+            infiltration = self.denormalize(
+                self.static_data["infiltration"],
+                self.static_stats["infiltration"]["mean"],
+                self.static_stats["infiltration"]["std"],
+            ).reshape(-1)
+            runoff_fraction = infiltration / 100.0
+        return precipitation_rate * area * runoff_fraction
 
     @staticmethod
     def normalize(
@@ -1917,7 +2582,8 @@ class HydroGraphDataset(Dataset):
         prefix: str,
         num_points: int,
         interval: int = 1,
-        skip: int = 72,
+        skip: Optional[int] = None,
+        post_peak_steps: Optional[int] = None,
     ):
         """
         Load dynamic data (water depth, inflow, volume, and precipitation) for a given hydrograph.
@@ -1929,33 +2595,116 @@ class HydroGraphDataset(Dataset):
             num_points (int): Number of spatial points (nodes).
             interval (int): Sampling interval.
             skip (int): Number of initial time steps to skip.
+            post_peak_steps (int): Number of samples retained after peak inflow.
 
         Returns:
             Tuple of np.ndarray: (water_depth, inflow_hydrograph, volume, precipitation)
         """
+        skip = self.dynamic_skip_steps if skip is None else int(skip)
+        post_peak_steps = (
+            self.post_peak_steps
+            if post_peak_steps is None
+            else int(post_peak_steps)
+        )
         wd_path = os.path.join(folder, f"{prefix}_WD_{hydrograph_id}.txt")
         inflow_path = os.path.join(folder, f"{prefix}_US_InF_{hydrograph_id}.txt")
         volume_path = os.path.join(folder, f"{prefix}_V_{hydrograph_id}.txt")
         vx_path = os.path.join(folder, f"{prefix}_VX_{hydrograph_id}.txt")
         vy_path = os.path.join(folder, f"{prefix}_VY_{hydrograph_id}.txt")
         precipitation_path = os.path.join(folder, f"{prefix}_Pr_{hydrograph_id}.txt")
+        node_precipitation_path = os.path.join(
+            folder, f"{prefix}_PrNode_{hydrograph_id}.npz"
+        )
         water_depth = np.loadtxt(wd_path, delimiter="\t")[skip::interval, :num_points]
-        inflow_hydrograph = np.loadtxt(inflow_path, delimiter="\t")[skip::interval, 1]
+        inflow_table = np.loadtxt(inflow_path, delimiter="\t")
+        time_days = inflow_table[:, 0]
+        inflow_hydrograph = inflow_table[skip::interval, 1]
         volume = np.loadtxt(volume_path, delimiter="\t")[skip::interval, :num_points]
         velocity_x = np.loadtxt(vx_path, delimiter="\t")[skip::interval, :num_points]
         velocity_y = np.loadtxt(vy_path, delimiter="\t")[skip::interval, :num_points]
         precipitation = np.loadtxt(precipitation_path, delimiter="\t")[skip::interval]
-        # Limit data until 25 time steps after the peak inflow.
+        local_precipitation = None
+        if os.path.exists(node_precipitation_path):
+            with np.load(node_precipitation_path, allow_pickle=False) as node_precip:
+                required_keys = {
+                    "input_rate_mm_per_hour",
+                    "hgn_time_origin_days",
+                    "input_interval_seconds",
+                    "units",
+                    "source",
+                }
+                missing_keys = required_keys.difference(node_precip.files)
+                if missing_keys:
+                    raise ValueError(
+                        f"Node precipitation file {node_precipitation_path} is "
+                        f"missing keys: {sorted(missing_keys)}"
+                    )
+                node_rate = np.asarray(
+                    node_precip["input_rate_mm_per_hour"], dtype=np.float32
+                )
+                origin_days = float(node_precip["hgn_time_origin_days"])
+                input_interval_seconds = float(
+                    node_precip["input_interval_seconds"]
+                )
+                units = str(node_precip["units"])
+                source = str(node_precip["source"])
+            if node_rate.ndim != 2 or node_rate.shape[1] != num_points:
+                raise ValueError(
+                    f"Node precipitation shape {node_rate.shape} does not match "
+                    f"{num_points} HGN nodes."
+                )
+            if units != "mm/h" or source != (
+                "pre_simulation_raster_values_and_cell_weights"
+            ):
+                raise ValueError(
+                    "Node precipitation must be inference-side HEC-RAS raster "
+                    f"input in mm/h; got units={units!r}, source={source!r}."
+                )
+            if input_interval_seconds <= 0.0:
+                raise ValueError("Node precipitation input interval must be positive.")
+            elapsed_seconds = (time_days - origin_days) * 86400.0
+            if np.min(elapsed_seconds) < -1.0e-3:
+                raise ValueError(
+                    "HGN time axis begins before node precipitation origin."
+                )
+            input_rows = np.ceil(
+                elapsed_seconds / input_interval_seconds - 1.0e-6
+            ).astype(np.int64)
+            if np.min(input_rows) < 0 or np.max(input_rows) >= node_rate.shape[0]:
+                raise ValueError(
+                    "HGN time axis exceeds the node precipitation input table."
+                )
+            local_precipitation = (
+                node_rate[input_rows][skip::interval]
+                * self.precipitation_unit_conversion
+            )
+        elif self.require_node_precipitation:
+            raise FileNotFoundError(
+                "Formal local conservation requires inference-side node "
+                f"precipitation: {node_precipitation_path}"
+            )
+        # Keep a configurable physical window after peak inflow.
         peak_time_idx = np.argmax(inflow_hydrograph)
-        water_depth = water_depth[: peak_time_idx + 25]
-        volume = volume[: peak_time_idx + 25]
-        velocity_x = velocity_x[: peak_time_idx + 25]
-        velocity_y = velocity_y[: peak_time_idx + 25]
+        trim_end = peak_time_idx + post_peak_steps
+        water_depth = water_depth[:trim_end]
+        volume = volume[:trim_end]
+        velocity_x = velocity_x[:trim_end]
+        velocity_y = velocity_y[:trim_end]
         precipitation = (
-            precipitation[: peak_time_idx + 25] * 2.7778e-7
-        )  # Unit conversion
-        inflow_hydrograph = inflow_hydrograph[: peak_time_idx + 25]
-        return water_depth, inflow_hydrograph, velocity_x, velocity_y, volume, precipitation
+            precipitation[:trim_end] * self.precipitation_unit_conversion
+        )
+        if local_precipitation is not None:
+            local_precipitation = local_precipitation[:trim_end]
+        inflow_hydrograph = inflow_hydrograph[:trim_end]
+        return (
+            water_depth,
+            inflow_hydrograph,
+            velocity_x,
+            velocity_y,
+            volume,
+            precipitation,
+            local_precipitation,
+        )
 
     def create_node_features(
         self,

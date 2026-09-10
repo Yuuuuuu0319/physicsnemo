@@ -1,0 +1,39 @@
+defaults:
+  - formal_si5m_common
+  - _self_
+
+seed: 0
+ckpt_path: /mnt/8tb_hdd2/joyce/formal_si5m_runs/selective_hard_seed0
+
+use_hecras_edge_flux_head: true
+hecras_face_graph_file: /mnt/8tb_hdd2/joyce/hecras-dataset/Linux_RAS_v66/Minxiong/outputs_si5m_v2_h1h100/HGN_dataset/hecras_face_graph_si5m_formal_h1h100.npz
+hecras_conservative_edge_target_dir: /mnt/8tb_hdd2/joyce/hecras-dataset/Linux_RAS_v66/Minxiong/outputs_si5m_v2_h1h100/HGN_dataset/conservative_edge_targets
+hecras_edge_flow_mode: conservative_sharded
+hecras_edge_flow_time_offset: null
+hecras_edge_flow_face_stats_npz: /mnt/8tb_hdd2/joyce/hecras-dataset/Linux_RAS_v66/Minxiong/outputs_si5m_v2_h1h100/HGN_dataset/conservative_edge_targets/train_only_face_stats.npz
+
+# Predict only faces that touch a high-fidelity interior control volume. The
+# remaining low-fidelity-only faces receive no edge-head computation.
+hecras_edge_flux_head_active_face_mode: high_interior_touch
+hecras_edge_flux_head_hidden_dim: 128
+hecras_edge_flux_head_num_hidden_layers: 2
+hecras_edge_flux_head_scale: 1.0
+hecras_edge_flux_head_use_face_normal: true
+hecras_edge_flux_head_use_surface_features: true
+hecras_edge_flux_head_use_physical_surface_features: true
+hecras_edge_flux_head_use_previous_face_flow: false
+hecras_edge_flux_head_use_edge_physical_features: true
+hecras_edge_flux_head_use_node_prediction_features: true
+hecras_edge_flux_head_output_mode: asinh_per_face_rms
+
+# The soft legacy edge objective stays off. This profile uses the
+# differentiable exact connected-control-volume layer instead.
+hecras_edge_flux_head_loss_weight: 0.0
+use_selective_hard_conservation: true
+require_node_precipitation: true
+selective_hard_conservation_loss_weight: 0.1
+selective_hard_conservation_raw_control_volume_weight: 0.01
+selective_hard_conservation_correction_weight_mode: training_face_rms_squared
+selective_hard_conservation_face_loss_normalization: asinh_per_face_rms
+selective_hard_conservation_node_loss_normalization: volume_std
+freeze_mesh_model_for_edge_flux_head: false
